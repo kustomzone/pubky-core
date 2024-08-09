@@ -1,3 +1,0 @@
-# Pk Homeserver
-
-Home
