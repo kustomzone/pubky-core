@@ -5,7 +5,6 @@ use wasm_bindgen::prelude::wasm_bindgen;
 
 pub use crux_core::bridge::{Bridge, Request};
 pub use crux_core::Core;
-pub use crux_http as http;
 
 pub use app::*;
 

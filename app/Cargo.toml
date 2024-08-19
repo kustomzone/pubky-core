@@ -16,6 +16,5 @@ rust-version = "1.66"
 
 [workspace.dependencies]
 anyhow = "1.0.86"
-crux_core = "0.8"
-crux_http = "0.9"
+crux_core = "0.8.1"
 serde = "1.0.202"
