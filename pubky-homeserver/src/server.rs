@@ -1,15 +1,13 @@
-use std::{
-    collections::HashMap, future::IntoFuture, net::SocketAddr, num::NonZeroUsize, sync::Arc,
-};
+use std::{future::IntoFuture, net::SocketAddr};
 
 use anyhow::{Error, Result};
 use pubky_common::auth::AuthnVerifier;
-use tokio::{net::TcpListener, signal, sync::Mutex, task::JoinSet};
+use tokio::{net::TcpListener, signal, task::JoinSet};
 use tracing::{debug, info, warn};
 
 use pkarr::{
     mainline::dht::{DhtSettings, Testnet},
-    PkarrClient, PkarrClientAsync, PublicKey, Settings, SignedPacket,
+    PkarrClient, PkarrClientAsync, PublicKey, Settings,
 };
 
 use crate::{config::Config, database::DB, pkarr::publish_server_packet};
@@ -32,7 +30,8 @@ impl Homeserver {
     pub async fn start(config: Config) -> Result<Self> {
         debug!(?config);
 
-        let public_key = config.keypair().public_key();
+        let keypair = config.keypair();
+        let public_key = keypair.public_key();
 
         let db = DB::open(&config.storage()?)?;
 
@@ -74,7 +73,7 @@ impl Homeserver {
 
         info!("Homeserver listening on http://localhost:{port}");
 
-        publish_server_packet(pkarr_client, config.keypair(), config.domain(), port).await?;
+        publish_server_packet(pkarr_client, &keypair, config.domain(), port).await?;
 
         info!("Homeserver listening on pubky://{public_key}");
 

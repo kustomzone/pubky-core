@@ -1,7 +1,7 @@
 use bytes::Bytes;
 
 use pkarr::PublicKey;
-use reqwest::{Method, Response, StatusCode};
+use reqwest::{Method, StatusCode};
 use url::Url;
 
 use crate::{
@@ -61,50 +61,34 @@ impl PubkyClient {
     }
 
     pub(crate) async fn pubky_to_http<T: TryInto<Url>>(&self, url: T) -> Result<Url> {
-        let mut original_url: Url = url.try_into().map_err(|_| Error::InvalidUrl)?;
-
-        if original_url.scheme() != "pubky" {
-            return Ok(original_url);
-        }
+        let original_url: Url = url.try_into().map_err(|_| Error::InvalidUrl)?;
 
         let pubky = original_url
             .host_str()
-            .ok_or(Error::Generic("Missing Pubky Url host".to_string()))?
-            .to_string();
+            .ok_or(Error::Generic("Missing Pubky Url host".to_string()))?;
 
-        let Endpoint { mut url, .. } = self
-            .resolve_pubky_homeserver(&PublicKey::try_from(pubky.clone())?)
-            .await?;
+        if let Ok(public_key) = PublicKey::try_from(pubky) {
+            let Endpoint { mut url, .. } = self.resolve_pubky_homeserver(&public_key).await?;
 
-        let path = original_url.path_segments();
+            // TODO: remove if we move to subdomains instead of paths.
+            if original_url.scheme() == "pubky" {
+                let path = original_url.path_segments();
 
-        // TODO: replace if we move to subdomains instead of paths.
-        let mut split = url.path_segments_mut().unwrap();
-        split.push(&pubky);
-        if let Some(segments) = path {
-            for segment in segments {
-                split.push(segment);
+                let mut split = url.path_segments_mut().unwrap();
+                split.push(pubky);
+                if let Some(segments) = path {
+                    for segment in segments {
+                        split.push(segment);
+                    }
+                }
+                drop(split);
             }
+
+            return Ok(url);
         }
-        drop(split);
 
-        Ok(url)
+        Ok(original_url)
     }
-}
-
-fn normalize_path(path: &str) -> Result<String> {
-    let mut path = path.to_string();
-
-    if path.starts_with('/') {
-        path = path[1..].to_string()
-    }
-
-    // TODO: should we return error instead?
-    if path.ends_with('/') {
-        path = path[..path.len()].to_string()
-    }
-
-    Ok(path)
 }
 
 #[cfg(test)]
@@ -177,7 +161,7 @@ mod tests {
                 Err(Error::Reqwest(error)) => {
                     assert!(error.status() == Some(StatusCode::UNAUTHORIZED))
                 }
-                error => {
+                _ => {
                     panic!("expected error StatusCode::UNAUTHORIZED")
                 }
             }
@@ -200,7 +184,7 @@ mod tests {
                 Err(Error::Reqwest(error)) => {
                     assert!(error.status() == Some(StatusCode::UNAUTHORIZED))
                 }
-                error => {
+                _ => {
                     panic!("expected error StatusCode::UNAUTHORIZED")
                 }
             }
