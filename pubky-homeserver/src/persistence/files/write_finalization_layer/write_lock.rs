@@ -11,6 +11,17 @@
 //! 3. [`hold`]: inside the finalization transaction, the lock is held until
 //!    commit, or the finalization is refused because the lock is gone.
 //!
+//! The hold lasts as long as the transaction. Should the transaction die
+//! while the backend request that publishes is still in flight, the lock can
+//! change hands and the request can land after it has moved on. What keeps
+//! such a request from replacing anyone else's write is the backend's own
+//! condition on the object it was prepared against, see
+//! [`staged_publish_layer`](crate::persistence::files::staged_publish_layer):
+//! it lands only if nobody has written since. The next holder's write wins
+//! over it, unless it lands after that write's finalization read the
+//! object's generation: then the write is refused with a conflict and the
+//! holder reads again and retries.
+//!
 //! The token travels as a task-local because OpenDAL's write and delete calls
 //! sit between the request and the finalization and have no slot for it. The
 //! task-local is private to this module: nothing else can set or read it.

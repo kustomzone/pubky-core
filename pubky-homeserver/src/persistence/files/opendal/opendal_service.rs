@@ -5,8 +5,8 @@ use crate::AppContext;
 use crate::{
     persistence::{
         files::{
-            events::EventsService, write_finalization_layer::WriteFinalizationLayer,
-            write_path_layer::WritePathLayer,
+            events::EventsService, staged_publish_layer::StagedPublishLayer,
+            write_finalization_layer::WriteFinalizationLayer, write_path_layer::WritePathLayer,
         },
         sql::SqlDb,
     },
@@ -21,6 +21,8 @@ use opendal::Buffer;
 use opendal::Operator;
 
 use super::super::{FileIoError, FileStream, WriteStreamError};
+#[cfg(feature = "storage-gcs")]
+use super::gcs_precondition;
 
 /// Build storage operators with one transactional finalization layer and an
 /// app-facing operator that additionally enforces write paths and collisions.
@@ -28,6 +30,13 @@ use super::super::{FileIoError, FileStream, WriteStreamError};
 /// Both operators share the same underlying storage backend, which is
 /// important for backends like `InMemory` where separate instances would
 /// have independent data.
+///
+/// A remote backend publishes and deletes under a generation condition
+/// through [`StagedPublishLayer`], so a request it executes late is refused
+/// rather than landing on a newer write. Every call to it is bounded by
+/// [`BACKEND_IO_TIMEOUT`], so a hung request cannot hold a finalization, and
+/// the user row with it, forever. A local backend's calls are not bounded:
+/// abandoning a filesystem rename would not stop it, only lose track of it.
 pub fn build_storage_operators(
     storage_config: &StorageToml,
     data_directory: &Path,
@@ -61,8 +70,7 @@ pub fn build_storage_operators(
                 "Store files in a Google Cloud Storage bucket: {}",
                 config.bucket_name
             );
-            let builder = config.to_builder()?;
-            opendal::Operator::new(builder)?.finish()
+            gcs_backend_operator(config)?
         }
         #[cfg(any(feature = "storage-memory", test))]
         StorageConfigToml::InMemory => {
@@ -91,6 +99,40 @@ pub fn build_storage_operators(
         ))
         .layer(WritePathLayer::new(user_service));
     Ok((operator, admin_operator))
+}
+
+/// Longest any one call to the remote backend may take before it is
+/// abandoned: a read or write of a chunk, a part upload, a list, a stat, the
+/// close that finishes an upload, the copy that publishes it, or a delete.
+/// Before this, a call to the bucket could hang for good.
+#[cfg(feature = "storage-gcs")]
+const BACKEND_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The Google Cloud Storage backend: its calls bounded, its publishes and
+/// deletes conditional on the object's generation, see [`StagedPublishLayer`].
+#[cfg(feature = "storage-gcs")]
+fn gcs_backend_operator(
+    config: &crate::data_directory::storage_config::GoogleBucketConfig,
+) -> Result<Operator, FileIoError> {
+    gcs_operator(config.to_builder()?)
+}
+
+/// The operator stack over a GCS service, see [`gcs_backend_operator`].
+#[cfg(feature = "storage-gcs")]
+pub(super) fn gcs_operator(builder: opendal::services::Gcs) -> Result<Operator, FileIoError> {
+    let http_client = opendal::raw::HttpClient::with(gcs_precondition::PreconditionFetcher::new(
+        reqwest::Client::new(),
+    ));
+    let operator = opendal::Operator::new(builder)?
+        .layer(opendal::layers::HttpClientLayer::new(http_client))
+        .finish()
+        .layer(
+            opendal::layers::TimeoutLayer::new()
+                .with_timeout(BACKEND_IO_TIMEOUT)
+                .with_io_timeout(BACKEND_IO_TIMEOUT),
+        )
+        .layer(StagedPublishLayer);
+    Ok(operator)
 }
 
 /// Build the storage operators from an `AppContext` (test-only convenience).
@@ -190,18 +232,25 @@ impl OpendalService {
     ///
     /// One `stat` sizes both: opendal would otherwise `stat` on its own to
     /// bound an open-ended chunked read, and a second observation could see a
-    /// blob that an overwrite published in between.
+    /// blob that an overwrite published in between. Every chunk is a read of
+    /// its own, so an overwrite landing mid-stream can make later chunks come
+    /// from the new blob. On a backend that returns an ETag the read is made
+    /// conditional on the one the `stat` returned, and such a chunk fails the
+    /// stream instead: the bytes delivered are all of one version. The
+    /// filesystem backend returns none, and opendal reopens the file for each
+    /// chunk, so there a read overlapping an overwrite can still mix the two
+    /// versions, as it always could.
     pub async fn get_sized_stream(
         &self,
         path: &EntryPath,
     ) -> Result<(u64, FileStream), FileIoError> {
-        let length = self.blob_length(path).await?;
-        let reader = self
-            .operator
-            .reader_with(path.as_str())
-            .chunk(CHUNK_SIZE)
-            .await?;
-        let stream = reader.into_bytes_stream(0..length).await?;
+        let metadata = self.operator.stat(path.as_str()).await?;
+        let length = metadata.content_length();
+        let mut reader = self.operator.reader_with(path.as_str()).chunk(CHUNK_SIZE);
+        if let Some(etag) = metadata.etag() {
+            reader = reader.if_match(etag);
+        }
+        let stream = reader.await?.into_bytes_stream(0..length).await?;
         Ok((length, Box::new(stream)))
     }
 
@@ -274,6 +323,44 @@ impl OpendalService {
 
 #[cfg(test)]
 mod tests {
+    /// A read streams one version of the blob or fails: once the blob is
+    /// replaced under it, the next chunk is refused rather than served from
+    /// the new version.
+    #[tokio::test]
+    async fn read_fails_rather_than_mix_two_versions_of_the_blob() {
+        use futures_util::StreamExt;
+        use pubky_common::crypto::Keypair;
+
+        use super::super::opendal_test_operators::{get_fs_operator, Versioned};
+        use crate::shared::webdav::{EntryPath, StoragePath};
+
+        let (fs, _tmp_dir) = get_fs_operator();
+        let versioned = Versioned::new("7");
+        let service = OpendalService::new_from_operator(fs.layer(versioned.clone()));
+        let path = EntryPath::new(
+            Keypair::random().public_key(),
+            StoragePath::new("/pub/a.bin").unwrap(),
+        );
+        service
+            .operator
+            .write(path.as_str(), vec![1u8; 3 * CHUNK_SIZE])
+            .await
+            .unwrap();
+
+        let (length, mut stream) = service.get_sized_stream(&path).await.unwrap();
+        assert_eq!(length as usize, 3 * CHUNK_SIZE);
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.len(), CHUNK_SIZE);
+
+        // The blob is replaced between two chunks.
+        versioned.set_generation("8");
+        stream
+            .next()
+            .await
+            .unwrap()
+            .expect_err("a chunk from another version of the blob is refused");
+    }
+
     use super::*;
     use crate::persistence::files::opendal::opendal_test_operators::OpendalTestOperators;
     use crate::shared::webdav::StoragePath;
