@@ -28,7 +28,7 @@ use zeroize::Zeroizing;
 
 use super::{
     approval::{GrantApproval, SignedApproval, VerifiedApproval},
-    grant_exchange::{credential_from_grant_exchange, post_grant_session},
+    grant_exchange::{credential_from_grant_exchange, refresh_grant_session},
     pop_signer::{DelegatedSignFn, GrantPopSigner},
     shared_session::GrantSessionCoordinator,
 };
@@ -38,7 +38,7 @@ use crate::{
     PubkyHttpClient,
     actors::session::SessionInfo,
     cross_log,
-    errors::{AuthError, Error, RequestError, Result},
+    errors::{AuthError, CredentialRefreshError, Error, RequestError, Result},
 };
 
 /// Refresh the bearer proactively when it has less than this many seconds left.
@@ -522,7 +522,7 @@ impl GrantCredential {
             return Ok(());
         }
 
-        let parsed = post_grant_session(
+        let parsed = refresh_grant_session(
             client,
             &state.grant_jws,
             &state.grant_claims,
@@ -648,13 +648,15 @@ impl SessionCredential for GrantCredential {
     ) -> Result<Option<SessionInfo>> {
         let request = self.grant_session_request(client, Method::GET).await?;
         let response = if let Some(coordinator) = self.coordinator().await {
+            // A shared send only checks HTTP status inside the refresh
+            // exchange, so a rejected refresh is how the server reports a
+            // missing session before the GET itself is answered.
             match self
                 .send_shared(request, client, coordinator.as_ref())
                 .await
             {
-                Err(Error::Request(RequestError::Server {
-                    status: StatusCode::UNAUTHORIZED | StatusCode::NOT_FOUND,
-                    ..
+                Err(Error::CredentialRefresh(CredentialRefreshError::Request {
+                    status: Some(StatusCode::UNAUTHORIZED | StatusCode::NOT_FOUND),
                 })) => return Ok(None),
                 result => result?,
             }
@@ -837,16 +839,29 @@ pub(crate) async fn sign_pop_for_grant(
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroUsize;
+    use std::{num::NonZeroUsize, time::Duration};
 
-    use pkarr::{Cache, InMemoryCache};
+    use pkarr::{Cache, InMemoryCache, SignedPacket, dns::rdata::SVCB};
     use pubky_common::{
         auth::jws::{ClientId, GRANT_JWS_TYP, GrantId},
-        capabilities::Capability,
+        capabilities::{Capabilities, Capability},
+        session::CookieSessionRecord,
     };
     use pubky_testnet::EphemeralTestnet;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+    use tokio::{
+        io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    use tokio_rustls::TlsAcceptor;
 
+    use super::super::shared_session::{GrantSessionLease, SharedGrantSession};
     use super::*;
+    #[allow(
+        deprecated,
+        reason = "cookie credential is the supported non-grant control"
+    )]
+    use crate::CookieCredential;
 
     #[tokio::test]
     #[pubky_testnet::test]
@@ -881,12 +896,13 @@ mod tests {
         };
         let jws = grant.sign(&user, GRANT_JWS_TYP);
         let signer = GrantPopSigner::local(pop_key);
-        let response = post_grant_session(&client, &jws, &grant, &signer, &homeserver)
+        let credential = credential_from_grant_exchange(&client, jws, grant, signer, homeserver)
             .await
             .unwrap();
-        let bearer = response.token.clone();
-        assert_eq!(response.session.token_expires_at, grant.exp);
-        let credential = GrantCredential::from_response(response, jws, grant, signer, homeserver);
+        let state = credential.state.lock().await;
+        let bearer = state.bearer.clone();
+        assert_eq!(state.session.token_expires_at, state.grant_claims.exp);
+        drop(state);
         for _ in 0..3 {
             credential.refresh(&client).await.unwrap();
             let request = credential
@@ -1245,6 +1261,500 @@ mod tests {
             .to_string();
 
         assert!(error.contains("unsupported grant credential token version"));
+    }
+
+    #[tokio::test]
+    async fn refresh_server_failure_has_typed_secret_safe_provenance() {
+        let fixture = RequestFailureFixture::new(TestServerBehavior::Reply(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 9\r\n\r\nsensitive".to_vec(),
+        ))
+        .await;
+        let credential = fixture.grant_credential(true);
+
+        let error = credential.refresh(&fixture.client).await.unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                Error::CredentialRefresh(CredentialRefreshError::Request {
+                    status: Some(StatusCode::SERVICE_UNAVAILABLE)
+                })
+            ),
+            "unexpected error: {error:?}"
+        );
+        let display = error.to_string();
+        assert_eq!(
+            display,
+            "Credential refresh failed: Grant credential refresh request failed"
+        );
+        let debug = format!("{error:?}");
+        for secret in [
+            "sensitive",
+            "test-bearer",
+            "auth/grant/session",
+            "localhost",
+        ] {
+            assert!(!display.contains(secret));
+            assert!(!debug.contains(secret));
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_error_status_does_not_wait_for_response_body() {
+        let fixture = RequestFailureFixture::new_with_timeout(
+            TestServerBehavior::ReplyThenStall(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 9\r\n\r\n".to_vec(),
+            ),
+            Duration::from_secs(5),
+        )
+        .await;
+        let credential = fixture.grant_credential(true);
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(1), credential.refresh(&fixture.client))
+                .await
+                .expect("refresh must discard the unread error body")
+                .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::CredentialRefresh(CredentialRefreshError::Request {
+                status: Some(StatusCode::SERVICE_UNAVAILABLE)
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn refresh_json_decode_failure_preserves_response_status() {
+        let fixture = RequestFailureFixture::new(TestServerBehavior::Reply(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nnot-json".to_vec(),
+        ))
+        .await;
+        let credential = fixture.grant_credential(true);
+
+        let error = credential.refresh(&fixture.client).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::CredentialRefresh(CredentialRefreshError::Request {
+                status: Some(StatusCode::OK)
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn refresh_timeout_has_typed_secret_safe_provenance() {
+        let fixture = RequestFailureFixture::new(TestServerBehavior::Stall).await;
+        let credential = fixture.grant_credential(true);
+
+        let error = credential.refresh(&fixture.client).await.unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                Error::CredentialRefresh(CredentialRefreshError::Request { status: None })
+            ),
+            "unexpected error: {error:?}"
+        );
+        let debug = format!("{error:?}");
+        assert!(!debug.contains("localhost"));
+        assert!(!debug.contains("auth/grant/session"));
+    }
+
+    #[tokio::test]
+    async fn shared_refresh_request_failure_uses_same_secret_safe_error() {
+        let fixture = RequestFailureFixture::new(TestServerBehavior::Reply(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 9\r\n\r\nsensitive".to_vec(),
+        ))
+        .await;
+        let credential = fixture.grant_credential(true);
+        let coordinator = TestCoordinator {
+            shared: Arc::new(tokio::sync::Mutex::new(Some(SharedGrantSession {
+                response: credential.state.lock().await.response(),
+                refresh_pending: false,
+                logout_pending: false,
+            }))),
+        };
+
+        let error = credential
+            .refresh_shared(&fixture.client, &coordinator, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::CredentialRefresh(CredentialRefreshError::Request {
+                status: Some(StatusCode::SERVICE_UNAVAILABLE)
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn refresh_preserves_local_authentication_failure() {
+        let (stored, claims) = stored_credential(now_unix() + 3600);
+        let credential = test_credential(
+            stored,
+            claims.clone(),
+            GrantPopSigner::delegated(
+                "missing-key".into(),
+                claims.cnf,
+                super::super::pop_signer::delegated_sign_callback(|_| async {
+                    Err(super::super::pop_signer::GrantSigningError::KeyUnavailable(
+                        "deleted key".into(),
+                    ))
+                }),
+            ),
+        );
+        credential.state.lock().await.session.token_expires_at = now_unix();
+        let client = PubkyHttpClient::new().unwrap();
+
+        let error = credential.refresh(&client).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Authentication(AuthError::Validation(message)) if message.contains("deleted key")
+        ));
+    }
+
+    #[tokio::test]
+    async fn shared_refresh_preserves_coordinator_request_failure() {
+        let (stored, claims) = stored_credential(now_unix() + 3600);
+        let signer = GrantPopSigner::local(Keypair::from_secret(&stored.client_key_secret));
+        let credential = test_credential(stored, claims, signer);
+        let client = PubkyHttpClient::new().unwrap();
+
+        let error = credential
+            .refresh_shared(&client, &FailingCoordinator, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::Request(RequestError::Validation { message }) if message == "browser storage failed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn shared_revalidation_treats_wrapped_missing_refresh_sessions_as_absent() {
+        for (status, reason) in [(401, "Unauthorized"), (404, "Not Found")] {
+            let response =
+                format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 7\r\n\r\nprivate");
+            let fixture =
+                RequestFailureFixture::new(TestServerBehavior::Reply(response.into_bytes())).await;
+            let credential = fixture.grant_credential(true);
+            let shared = SharedGrantSession {
+                response: credential.state.lock().await.response(),
+                refresh_pending: false,
+                logout_pending: false,
+            };
+            credential.state.lock().await.coordinator = Some(Arc::new(TestCoordinator {
+                shared: Arc::new(tokio::sync::Mutex::new(Some(shared))),
+            }));
+
+            let result = credential
+                .revalidate(&fixture.client, &fixture.user.public_key())
+                .await;
+
+            assert!(
+                matches!(result, Ok(None)),
+                "wrapped {status} refresh failure must mean missing session, got {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_server_failure_remains_request_error_for_all_credentials() {
+        for credential in [CredentialKind::Grant, CredentialKind::Cookie] {
+            let fixture = RequestFailureFixture::new(TestServerBehavior::Reply(
+                b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 7\r\n\r\nstorage".to_vec(),
+            ))
+            .await;
+            let session = fixture.session(credential);
+
+            let error = session.storage().get("/pub/test/file").await.unwrap_err();
+
+            assert!(matches!(
+                error,
+                Error::Request(RequestError::Server {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_timeout_remains_request_error_for_all_credentials() {
+        for credential in [CredentialKind::Grant, CredentialKind::Cookie] {
+            let fixture = RequestFailureFixture::new(TestServerBehavior::Stall).await;
+            let session = fixture.session(credential);
+
+            let error = session.storage().get("/pub/test/file").await.unwrap_err();
+
+            assert!(matches!(
+                error,
+                Error::Request(RequestError::Transport(ref source)) if source.is_timeout()
+            ));
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum CredentialKind {
+        Grant,
+        Cookie,
+    }
+
+    #[derive(Debug)]
+    struct TestCoordinator {
+        shared: Arc<tokio::sync::Mutex<Option<SharedGrantSession>>>,
+    }
+
+    #[derive(Debug)]
+    struct FailingCoordinator;
+
+    #[async_trait]
+    impl GrantSessionCoordinator for FailingCoordinator {
+        async fn acquire(&self, _: bool) -> Result<Box<dyn GrantSessionLease>> {
+            Err(RequestError::Validation {
+                message: "browser storage failed".into(),
+            }
+            .into())
+        }
+    }
+
+    #[derive(Debug)]
+    struct TestLease {
+        shared: Arc<tokio::sync::Mutex<Option<SharedGrantSession>>>,
+    }
+
+    #[async_trait]
+    impl GrantSessionCoordinator for TestCoordinator {
+        async fn acquire(&self, _: bool) -> Result<Box<dyn GrantSessionLease>> {
+            Ok(Box::new(TestLease {
+                shared: Arc::clone(&self.shared),
+            }))
+        }
+    }
+
+    #[async_trait]
+    impl GrantSessionLease for TestLease {
+        async fn load(&self) -> Result<Option<SharedGrantSession>> {
+            Ok(self.shared.lock().await.clone())
+        }
+
+        async fn store(&self, session: &SharedGrantSession) -> Result<()> {
+            *self.shared.lock().await = Some(session.clone());
+            Ok(())
+        }
+
+        async fn remove(&self) -> Result<()> {
+            *self.shared.lock().await = None;
+            Ok(())
+        }
+    }
+
+    /// A client whose homeserver resolves to a one-shot TLS server.
+    struct RequestFailureFixture {
+        client: PubkyHttpClient,
+        user: Keypair,
+        homeserver: pkarr::Keypair,
+    }
+
+    impl RequestFailureFixture {
+        async fn new(behavior: TestServerBehavior) -> Self {
+            Self::new_with_timeout(behavior, Duration::from_millis(100)).await
+        }
+
+        async fn new_with_timeout(behavior: TestServerBehavior, timeout: Duration) -> Self {
+            let port = spawn_https_test_server(behavior).await;
+            let homeserver = pkarr::Keypair::random();
+            let user = Keypair::random();
+            let cache = resolver_cache(&homeserver, &user, port);
+
+            let mut builder = PubkyHttpClient::builder();
+            builder
+                .isolated_pkarr_test()
+                .pkarr(|builder| builder.cache(cache))
+                .request_timeout(timeout)
+                .add_root_certificates_pem(include_bytes!("../../../client/test_certs/ca.pem"))
+                .unwrap();
+            let fixture = Self {
+                client: builder.build().unwrap(),
+                user,
+                homeserver,
+            };
+            fixture
+                .client
+                .features
+                .insert(&fixture.homeserver_pk(), &[]);
+            fixture
+        }
+
+        fn homeserver_pk(&self) -> PublicKey {
+            PublicKey::try_from_z32(&self.homeserver.public_key().to_string()).unwrap()
+        }
+
+        #[allow(
+            deprecated,
+            reason = "cookie credential is the supported non-grant control"
+        )]
+        fn session(&self, credential: CredentialKind) -> PubkySession {
+            match credential {
+                CredentialKind::Grant => PubkySession::from_grant_credential(
+                    self.client.clone(),
+                    self.grant_credential(false),
+                ),
+                CredentialKind::Cookie => PubkySession::from_cookie_credential(
+                    self.client.clone(),
+                    self.cookie_credential(),
+                ),
+            }
+        }
+
+        /// A credential whose bearer is either already due for refresh or
+        /// valid for an hour.
+        fn grant_credential(&self, refresh: bool) -> GrantCredential {
+            let client_keypair = Keypair::random();
+            let now = now_unix();
+            let claims = GrantClaims {
+                iss: self.user.public_key(),
+                client_id: ClientId::new("refresh-errors.test").unwrap(),
+                caps: vec![Capability::root()],
+                cnf: client_keypair.public_key(),
+                jti: GrantId::generate(),
+                iat: now,
+                exp: now + 3600,
+            };
+            let homeserver = self.homeserver_pk();
+            GrantCredential::from_response(
+                GrantSessionResponse {
+                    token: "test-bearer".into(),
+                    session: GrantSessionInfo {
+                        homeserver: homeserver.clone(),
+                        pubky: claims.iss.clone(),
+                        client_id: claims.client_id.clone(),
+                        capabilities: claims.caps.clone(),
+                        grant_id: claims.jti.clone(),
+                        token_expires_at: if refresh { now } else { now + 3600 },
+                        grant_expires_at: claims.exp,
+                        created_at: now,
+                    },
+                },
+                claims.sign(&self.user, GRANT_JWS_TYP),
+                claims,
+                GrantPopSigner::local(client_keypair),
+                homeserver,
+            )
+        }
+
+        #[allow(
+            deprecated,
+            reason = "cookie credential is the supported non-grant control"
+        )]
+        fn cookie_credential(&self) -> CookieCredential {
+            let record = CookieSessionRecord::new(
+                &self.user.public_key(),
+                Capabilities::from(vec![Capability::root()]),
+                None,
+            );
+            CookieCredential::new(
+                self.user.public_key(),
+                Some("cookie-secret".into()),
+                record,
+                Some(self.homeserver_pk()),
+            )
+        }
+    }
+
+    /// How the one-shot TLS server answers the single request it accepts.
+    enum TestServerBehavior {
+        /// Write these raw HTTP bytes once the request headers have arrived.
+        Reply(Vec<u8>),
+        /// Write response headers, then keep the declared body pending.
+        ReplyThenStall(Vec<u8>),
+        /// Keep the connection open without answering.
+        Stall,
+    }
+
+    /// Accept one TLS connection on an ephemeral `localhost` port and return that port.
+    async fn spawn_https_test_server(behavior: TestServerBehavior) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let acceptor = TlsAcceptor::from(Arc::new(test_server_config()));
+
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = acceptor.accept(stream).await.unwrap();
+            if !read_request_headers(&mut stream).await {
+                return;
+            }
+            match behavior {
+                TestServerBehavior::Reply(response) => stream.write_all(&response).await.unwrap(),
+                TestServerBehavior::ReplyThenStall(response) => {
+                    stream.write_all(&response).await.unwrap();
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                TestServerBehavior::Stall => tokio::time::sleep(Duration::from_secs(1)).await,
+            }
+        });
+
+        port
+    }
+
+    fn test_server_config() -> rustls::ServerConfig {
+        let server_cert =
+            CertificateDer::from_pem_slice(include_bytes!("../../../client/test_certs/server.pem"))
+                .unwrap();
+        let server_key =
+            PrivateKeyDer::from_pem_slice(include_bytes!("../../../client/test_certs/server.key"))
+                .unwrap();
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![server_cert], server_key)
+        .unwrap()
+    }
+
+    /// Returns `false` when the client hung up before sending its headers.
+    async fn read_request_headers(stream: &mut (impl AsyncRead + Unpin)) -> bool {
+        let mut request = Vec::new();
+        let mut buffer = [0; 1024];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = stream.read(&mut buffer).await.unwrap();
+            if read == 0 {
+                return false;
+            }
+            request.extend_from_slice(&buffer[..read]);
+        }
+        true
+    }
+
+    /// Pkarr cache that points `user` at `homeserver` and `homeserver` at
+    /// `localhost:port`, so no DHT lookups happen.
+    fn resolver_cache(homeserver: &pkarr::Keypair, user: &Keypair, port: u16) -> Arc<dyn Cache> {
+        let cache: Arc<dyn Cache> = Arc::new(InMemoryCache::new(NonZeroUsize::new(2).unwrap()));
+
+        let mut endpoint = SVCB::new(10, "localhost".try_into().unwrap());
+        endpoint.set_port(port);
+        let homeserver_packet = SignedPacket::builder()
+            .https(".".try_into().unwrap(), endpoint, 3600)
+            .sign(homeserver)
+            .unwrap();
+        cache.put(&homeserver.public_key().into(), &homeserver_packet);
+
+        let homeserver_z32 = homeserver.public_key().to_string();
+        let alias = SVCB::new(0, homeserver_z32.as_str().try_into().unwrap());
+        let user_pkarr = pkarr::PublicKey::try_from(user.public_key().z32().as_str()).unwrap();
+        let user_packet = SignedPacket::builder()
+            .https("_pubky".try_into().unwrap(), alias, 3600)
+            .sign(&pkarr::Keypair::from_secret_key(&user.secret()))
+            .unwrap();
+        cache.put(&user_pkarr.into(), &user_packet);
+
+        cache
     }
 
     fn stored_credential(exp: u64) -> (StoredGrantCredential, GrantClaims) {

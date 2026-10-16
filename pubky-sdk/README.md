@@ -85,10 +85,16 @@ let pubky = Pubky::with_client(client);
 # Ok::<_, pubky::BuildError>(())
 ```
 
-The setting applies to all checked requests made through that client, including
-credential-refresh errors. Set it to `0` to skip error-body reads and use the
-HTTP status reason as the message. Positive limits preserve short messages and
-mark longer ones with `\n[response body truncated at N bytes]`.
+The setting applies to checked requests made through that client except
+credential refresh. Refresh HTTP failures always skip and cancel response
+bodies regardless of `max_error_body_bytes`. Refresh request failures surface
+as `Error::CredentialRefresh(CredentialRefreshError)`. Other error categories
+keep their original variants. The refresh request error retains an optional
+HTTP status but redacts HTTP response bodies and request URLs from `Display`
+and `Debug`. Other checked request errors use the captured message. Set the
+limit to `0` to skip error-body reads and use the HTTP status reason as that
+message. Positive limits preserve short messages and mark longer ones with
+`\n[response body truncated at N bytes]`.
 
 The limit caps captured response bytes. Invalid UTF-8 can expand the message to
 three times that size, plus the truncation marker. Transport buffers and
