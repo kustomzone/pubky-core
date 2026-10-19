@@ -56,7 +56,7 @@
 mod file;
 mod layer_domain_error;
 mod opendal;
-mod preflight;
+mod write_check;
 
 pub(crate) mod events;
 pub(crate) mod staged_publish_layer;

@@ -3,8 +3,8 @@ use std::{future::Future, sync::Arc};
 use crate::persistence::files::{
     events::EventsService,
     layer_domain_error::LayerDomainError,
-    preflight::{preflight_copier, Preflight, PreflightWriter},
     staged_publish_layer::{live_generation, under_expected_generation, ExpectedGeneration},
+    write_check::{checked_copier, CheckedWriter, WriteCheck},
 };
 use crate::persistence::sql::{entry::EntryRepository, SqlDb, UnifiedExecutor};
 use crate::services::user_service::UserService;
@@ -19,7 +19,9 @@ use super::{write_lock, WriteFinalizationDeleter, WriteFinalizationWriter};
 ///
 /// The related database changes are committed together in one transaction.
 /// App-facing operators also reject path collisions; admin operators allow them
-/// so they can repair legacy data.
+/// so they can repair legacy data. A write or copy is checked for a collision
+/// before its first byte, its close, or the copy reaches the layers
+/// underneath, see [`write_check`](crate::persistence::files::write_check).
 ///
 /// Blob storage cannot be part of the database transaction. The ways the two
 /// can still diverge are described in the [`files`](crate::persistence::files)
@@ -207,22 +209,30 @@ impl WriteFinalizationService {
         Operator::from_parts(ctx.clone(), self.inner.clone())
     }
 
-    /// A preflight that rejects a write or copy to `entry_path` early if it
-    /// would collide with a file or folder. The finalization checks again
-    /// under the lock.
-    fn collision_preflight(&self, entry_path: EntryPath) -> Preflight {
-        let finalizer = self.finalizer.clone();
-        Arc::new(move || {
-            let finalizer = finalizer.clone();
-            let entry_path = entry_path.clone();
-            Box::pin(async move { finalizer.collision_preflight(&entry_path).await })
-        })
+    fn collision_check(&self, entry_path: EntryPath) -> CollisionCheck {
+        CollisionCheck {
+            finalizer: self.finalizer.clone(),
+            entry_path,
+        }
+    }
+}
+
+/// Rejects a write or copy to `entry_path` early if it would collide with a
+/// file or folder. The finalization checks again under the lock.
+pub(crate) struct CollisionCheck {
+    finalizer: Arc<Finalizer>,
+    entry_path: EntryPath,
+}
+
+impl WriteCheck for CollisionCheck {
+    async fn check(&self) -> Result<()> {
+        self.finalizer.collision_preflight(&self.entry_path).await
     }
 }
 
 impl Service for WriteFinalizationService {
     type Reader = oio::Reader;
-    type Writer = PreflightWriter<WriteFinalizationWriter<oio::Writer>>;
+    type Writer = CheckedWriter<WriteFinalizationWriter<oio::Writer>, CollisionCheck>;
     type Lister = oio::Lister;
     type Deleter = WriteFinalizationDeleter<oio::Deleter>;
     type Copier = oio::OneShotCopier;
@@ -260,10 +270,7 @@ impl Service for WriteFinalizationService {
             self.finalizer.clone(),
             entry_path.clone(),
         );
-        Ok(PreflightWriter::new(
-            writer,
-            self.collision_preflight(entry_path),
-        ))
+        Ok(CheckedWriter::new(writer, self.collision_check(entry_path)))
     }
 
     fn copy(
@@ -275,9 +282,15 @@ impl Service for WriteFinalizationService {
     ) -> Result<Self::Copier> {
         let from = EntryPath::parse_opendal(from)?;
         let to = EntryPath::parse_opendal(to)?;
-        let (inner, ctx, to_path) = (self.inner.clone(), ctx.clone(), to.clone());
-        let copier = move || inner.copy(&ctx, from.as_str(), to_path.as_str(), args);
-        Ok(preflight_copier(self.collision_preflight(to), copier))
+        let check = self.collision_check(to.clone());
+        Ok(checked_copier(
+            check,
+            &self.inner,
+            ctx,
+            from.as_str(),
+            to.as_str(),
+            args,
+        ))
     }
 
     async fn rename(

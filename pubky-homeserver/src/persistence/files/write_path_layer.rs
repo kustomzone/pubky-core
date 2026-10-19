@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::persistence::files::layer_domain_error::LayerDomainError;
-use crate::persistence::files::preflight::{preflight_copier, Preflight, PreflightWriter};
+use crate::persistence::files::write_check::{checked_copier, CheckedWriter, WriteCheck};
 use crate::services::user_service::UserService;
 use crate::shared::webdav::EntryPath;
 use opendal::raw::*;
@@ -16,7 +16,7 @@ use opendal::{Capability, OperationContext, Result};
 /// - Writes, deletes, copies, renames, and create_dir check the user's
 ///   `allowed_write_paths` and return `PermissionDenied` if the path is not in the allow list.
 ///   A write or copy is checked before its first byte, its close, or the
-///   copy reaches the layers underneath, see [`preflight`](super::preflight).
+///   copy reaches the layers underneath, see [`write_check`](super::write_check).
 #[derive(Debug, Clone)]
 pub struct WritePathLayer {
     user_service: UserService,
@@ -44,15 +44,23 @@ pub(crate) struct WritePathService {
 }
 
 impl WritePathService {
-    /// A preflight that checks the user may write to `path`.
-    fn write_path_allowed(&self, path: &str) -> Preflight {
-        let user_service = self.user_service.clone();
-        let path = path.to_string();
-        Arc::new(move || {
-            let user_service = user_service.clone();
-            let path = path.clone();
-            Box::pin(async move { check_write_path_allowed(&user_service, &path).await })
-        })
+    fn write_path_check(&self, path: &str) -> WritePathCheck {
+        WritePathCheck {
+            user_service: self.user_service.clone(),
+            path: path.to_string(),
+        }
+    }
+}
+
+/// Checks that the user may write to `path`, for a write or copy.
+pub(crate) struct WritePathCheck {
+    user_service: UserService,
+    path: String,
+}
+
+impl WriteCheck for WritePathCheck {
+    async fn check(&self) -> Result<()> {
+        check_write_path_allowed(&self.user_service, &self.path).await
     }
 }
 
@@ -91,7 +99,7 @@ async fn check_write_path_allowed(user_service: &UserService, path: &str) -> Res
 
 impl Service for WritePathService {
     type Reader = oio::Reader;
-    type Writer = PreflightWriter<oio::Writer>;
+    type Writer = CheckedWriter<oio::Writer, WritePathCheck>;
     type Lister = oio::Lister;
     type Deleter = WritePathDeleter<oio::Deleter>;
     type Copier = oio::OneShotCopier;
@@ -121,7 +129,7 @@ impl Service for WritePathService {
 
     fn write(&self, ctx: &OperationContext, path: &str, args: OpWrite) -> Result<Self::Writer> {
         let writer = self.inner.write(ctx, path, args)?;
-        Ok(PreflightWriter::new(writer, self.write_path_allowed(path)))
+        Ok(CheckedWriter::new(writer, self.write_path_check(path)))
     }
 
     fn copy(
@@ -131,14 +139,8 @@ impl Service for WritePathService {
         to: &str,
         args: OpCopy,
     ) -> Result<Self::Copier> {
-        let (inner, ctx, from, to_path) = (
-            self.inner.clone(),
-            ctx.clone(),
-            from.to_string(),
-            to.to_string(),
-        );
-        let copier = move || inner.copy(&ctx, &from, &to_path, args);
-        Ok(preflight_copier(self.write_path_allowed(to), copier))
+        let check = self.write_path_check(to);
+        Ok(checked_copier(check, &self.inner, ctx, from, to, args))
     }
 
     async fn rename(
