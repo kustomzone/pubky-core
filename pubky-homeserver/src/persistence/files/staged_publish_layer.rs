@@ -67,14 +67,29 @@ pub(crate) enum ExpectedGeneration {
     Known(u64),
 }
 
+/// The generation GCS reads as "no live object". A request that must create
+/// its object carries it as `if_version_match`, because opendal cannot send
+/// `if_not_exists` on a GCS copy.
+const NO_OBJECT_GENERATION: u64 = 0;
+
 impl ExpectedGeneration {
     /// The version the request is conditional on, as opendal's
-    /// `if_version_match` takes it. GCS reads generation 0 as "no live
-    /// object". opendal's `if_not_exists` cannot ask that of a GCS copy.
+    /// `if_version_match` takes it.
     pub(crate) fn version_condition(self) -> String {
         match self {
-            Self::Absent => "0".to_string(),
-            Self::Known(generation) => generation.to_string(),
+            Self::Absent => NO_OBJECT_GENERATION,
+            Self::Known(generation) => generation,
+        }
+        .to_string()
+    }
+
+    /// The expectation a request's `if_version_match` carries, the reverse
+    /// of [`Self::version_condition`].
+    #[cfg(test)]
+    pub(crate) fn from_version_condition(condition: &str) -> Self {
+        match condition.parse().expect("a generation is a number") {
+            NO_OBJECT_GENERATION => Self::Absent,
+            generation => Self::Known(generation),
         }
     }
 }
@@ -98,20 +113,30 @@ pub(crate) async fn under_expected_generation<T>(
 }
 
 /// The generation the object at `path` has now. `None` on a backend that
-/// reports no usable generation: a publish or delete under `None` is refused
-/// by this layer, see [`StagedWriter`].
+/// reports no generation: a publish or delete under `None` is refused by
+/// this layer, see [`StagedWriter`].
 pub(crate) async fn live_generation(
     backend: &Operator,
     path: &str,
 ) -> Result<Option<ExpectedGeneration>> {
     match backend.stat(path).await {
-        Ok(metadata) => Ok(metadata
+        Ok(metadata) => metadata
             .version()
-            .and_then(|version| version.parse().ok())
-            .map(ExpectedGeneration::Known)),
+            .map(|version| parse_generation(path, version))
+            .transpose(),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(Some(ExpectedGeneration::Absent)),
         Err(error) => Err(error),
     }
+}
+
+fn parse_generation(path: &str, version: &str) -> Result<ExpectedGeneration> {
+    let generation = version.parse().map_err(|_| {
+        opendal::Error::new(
+            ErrorKind::Unexpected,
+            format!("The backend reports generation {version:?} for {path}, not a number"),
+        )
+    })?;
+    Ok(ExpectedGeneration::Known(generation))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -266,6 +291,9 @@ impl oio::Write for StagedWriter {
         }
         self.upload = Upload::Staged;
 
+        // The generation is only available now: the finalization reads it
+        // under the lock and sets it around the close. So a write without
+        // one still costs a staged upload, which is removed below.
         let published = match expected_generation() {
             Some(expected) => {
                 let published = self
@@ -401,6 +429,19 @@ fn publish_conflict(path: &str, error: opendal::Error) -> opendal::Error {
     .set_source(LayerDomainError::PublishConflict)
 }
 
+/// Staging objects left behind on `operator`. The listing names the prefix
+/// itself too.
+#[cfg(test)]
+pub(crate) async fn staging_objects(operator: &Operator) -> usize {
+    operator
+        .list(STAGING_PREFIX)
+        .await
+        .unwrap()
+        .iter()
+        .filter(|entry| entry.metadata().is_file())
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::Ordering;
@@ -442,16 +483,6 @@ mod tests {
     /// Run `request` as the finalization would: under generation 7.
     async fn under_7<T>(request: impl std::future::Future<Output = T>) -> T {
         under_expected_generation(ExpectedGeneration::Known(7), request).await
-    }
-
-    /// Staging objects left behind. The listing names the prefix itself too.
-    async fn staging_objects(operator: &Operator) -> usize {
-        operator.list(STAGING_PREFIX).await.map_or(0, |entries| {
-            entries
-                .iter()
-                .filter(|entry| entry.metadata().is_file())
-                .count()
-        })
     }
 
     #[tokio::test]
@@ -718,7 +749,24 @@ mod tests {
     fn condition_value_follows_the_expectation() {
         assert_eq!(ExpectedGeneration::Absent.version_condition(), "0");
         assert_eq!(ExpectedGeneration::Known(7).version_condition(), "7");
-        assert_eq!(expected_generation(), None);
+        for expected in [ExpectedGeneration::Absent, ExpectedGeneration::Known(7)] {
+            assert_eq!(
+                ExpectedGeneration::from_version_condition(&expected.version_condition()),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_generation_that_is_not_a_number_is_an_error() {
+        let path = "pk/pub/a.txt";
+        let (plain, _tmp_dir) = plain_fs();
+        plain.write(path, b"x".to_vec()).await.unwrap();
+        let versioned = plain.layer(Versioned::new("not-a-number"));
+
+        let error = live_generation(&versioned, path).await.unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::Unexpected);
     }
 
     #[tokio::test]

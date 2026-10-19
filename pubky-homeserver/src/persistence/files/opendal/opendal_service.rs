@@ -106,8 +106,7 @@ pub fn build_storage_operators(
 #[cfg(feature = "storage-gcs")]
 const BACKEND_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The Google Cloud Storage backend: its calls bounded, its publishes and
-/// deletes conditional on the object's generation, see [`StagedPublishLayer`].
+/// The Google Cloud Storage operator for `config`, see [`gcs_operator`].
 #[cfg(feature = "storage-gcs")]
 fn gcs_backend_operator(
     config: &crate::data_directory::storage_config::GoogleBucketConfig,
@@ -115,15 +114,20 @@ fn gcs_backend_operator(
     gcs_operator(config.to_builder()?)
 }
 
-/// The operator stack over a GCS service, see [`gcs_backend_operator`].
+/// The operator stack over a GCS service: its calls bounded, its writes
+/// published and its deletes made under the object's generation, see
+/// [`StagedPublishLayer`].
 #[cfg(feature = "storage-gcs")]
 pub(super) fn gcs_operator(builder: opendal::services::Gcs) -> Result<Operator, FileIoError> {
-    Ok(gcs_backend(builder)?.layer(StagedPublishLayer))
+    Ok(gcs_unstaged_backend(builder)?.layer(StagedPublishLayer))
 }
 
-/// The GCS service under [`gcs_operator`]'s staging, its calls bounded.
+/// The GCS service under [`gcs_operator`]'s staging, its calls bounded. Its
+/// writes and deletes carry no generation condition of their own.
 #[cfg(feature = "storage-gcs")]
-pub(super) fn gcs_backend(builder: opendal::services::Gcs) -> Result<Operator, FileIoError> {
+pub(super) fn gcs_unstaged_backend(
+    builder: opendal::services::Gcs,
+) -> Result<Operator, FileIoError> {
     let operator = with_own_http_client(opendal::Operator::new(builder)?).layer(
         opendal::layers::TimeoutLayer::new()
             .with_timeout(BACKEND_IO_TIMEOUT)
@@ -132,11 +136,13 @@ pub(super) fn gcs_backend(builder: opendal::services::Gcs) -> Result<Operator, F
     Ok(operator)
 }
 
-#[cfg(any(feature = "storage-gcs", test))]
 /// `operator` with an HTTP client of its own. opendal's default client is
 /// shared by the process, and a connection it pools dies with the runtime
 /// that opened it: tests, and a test's cleaner, each run on a runtime of
-/// their own.
+/// their own. The production GCS operator gets one too, through
+/// [`gcs_unstaged_backend`], so it runs on the client the real-bucket tests
+/// check. One client per operator costs nothing there.
+#[cfg(any(feature = "storage-gcs", test))]
 pub(super) fn with_own_http_client(operator: Operator) -> Operator {
     let transport = opendal_http_transport_reqwest::ReqwestTransport::new(reqwest::Client::new());
     operator.with_context(
@@ -666,7 +672,7 @@ mod tests {
         use crate::persistence::files::layer_domain_error::LayerDomainError;
         use crate::persistence::files::opendal::opendal_test_operators::OpendalGcpCleaner;
         use crate::persistence::files::staged_publish_layer::{
-            live_generation, under_expected_generation, ExpectedGeneration, STAGING_PREFIX,
+            live_generation, staging_objects, under_expected_generation, ExpectedGeneration,
         };
 
         let (Ok(bucket), Ok(credentials)) = (
@@ -686,7 +692,7 @@ mod tests {
         // The production stack, and the backend under its staged publish,
         // through which the late requests below are sent.
         let operator = gcs_operator(builder()).unwrap();
-        let backend = gcs_backend(builder()).unwrap();
+        let backend = gcs_unstaged_backend(builder()).unwrap();
         // Removes the test root from the bucket on drop.
         let _cleaner = AsyncDropper::new(OpendalGcpCleaner::new(Some(backend.clone())));
         let entry_path = EntryPath::new(
@@ -704,15 +710,6 @@ mod tests {
                 .await
                 .unwrap()
                 .expect("GCS reports a generation")
-        };
-        let staging_objects = || async {
-            operator
-                .list(STAGING_PREFIX)
-                .await
-                .unwrap()
-                .iter()
-                .filter(|entry| entry.metadata().is_file())
-                .count()
         };
 
         // 1. A single-request upload, then a multipart one.
@@ -734,7 +731,7 @@ mod tests {
             vec![2u8; large]
         );
         assert_eq!(
-            staging_objects().await,
+            staging_objects(&operator).await,
             0,
             "every staging object was removed"
         );
@@ -815,7 +812,7 @@ mod tests {
             .await
             .unwrap();
         assert!(!operator.exists(path).await.unwrap());
-        assert_eq!(staging_objects().await, 0);
+        assert_eq!(staging_objects(&operator).await, 0);
     }
 
     // Multi-threaded for the cleaner, which blocks on its async drop.

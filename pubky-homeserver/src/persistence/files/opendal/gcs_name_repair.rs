@@ -52,7 +52,7 @@ use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
 use pubky_common::crypto::{Hash, Hasher};
 use tokio::task::JoinHandle;
 
-use super::opendal_service::gcs_backend;
+use super::opendal_service::gcs_unstaged_backend;
 use crate::data_directory::storage_config::GoogleBucketConfig;
 use crate::persistence::files::staged_publish_layer::ExpectedGeneration;
 use crate::persistence::sql::entry::{EntryEntity, EntryRepository};
@@ -159,7 +159,7 @@ impl Drop for GcsNameRepairJob {
 /// copies and deletes objects itself, under conditions of its own.
 fn build_operator(config: &GoogleBucketConfig) -> anyhow::Result<Operator> {
     let builder = config.to_builder()?;
-    Ok(gcs_backend(builder)?)
+    Ok(gcs_unstaged_backend(builder)?)
 }
 
 /// What one start of the repair did.
@@ -1418,7 +1418,7 @@ mod tests {
         // The backend without the staged publish, to store objects under
         // the names an affected version gave them. Those names are pinned
         // against a real bucket by `misnamed_object_name_is_the_name_gcs_stored`.
-        let backend = gcs_backend(builder()).unwrap();
+        let backend = gcs_unstaged_backend(builder()).unwrap();
         // Removes the test root from the bucket on drop.
         let _cleaner = AsyncDropper::new(OpendalGcpCleaner::new(Some(backend.clone())));
         let db = SqlDb::test().await;
@@ -1472,7 +1472,7 @@ mod tests {
             .unwrap();
 
         let repair = GcsNameRepair {
-            operator: gcs_backend(builder()).unwrap(),
+            operator: gcs_unstaged_backend(builder()).unwrap(),
             sql_db: db.clone(),
         };
         assert_eq!(

@@ -205,15 +205,21 @@ pub(crate) fn get_memory_operator() -> Operator {
 }
 
 /// A backend for tests that behaves like an object store on the points the
-/// generation condition relies on: it reports a generation and an ETag on
-/// stat, refuses a read whose `If-Match` is not the current ETag when the
-/// read is sent, records the condition each copy, compose and delete of a
-/// real path carries, refuses a conditional delete of a missing object,
-/// refuses copies, composes or deletes on demand as the store does when the
-/// condition fails, composes one source as a copy of the generation asked
-/// for, can hold a stat, read or compose back until told to go on, and
-/// deletes through a batching deleter. Layered over a real backend, which
-/// does the storing without conditions.
+/// generation condition relies on. Layered over a real backend, which does
+/// the storing without conditions.
+///
+/// - A stat reports the generation and an ETag. A read whose `If-Match` is
+///   not the current ETag is refused when it is sent.
+/// - Each copy, compose and delete of a real path records its condition in
+///   `seen`.
+/// - `refuse_copies`, `refuse_composes` and `refuse_deletes` refuse those
+///   requests as the store does when the condition fails. A conditional
+///   delete of a missing object is refused too.
+/// - A compose of one source copies the generation asked for.
+/// - The `stall_next_*` methods hold a stat, read or compose back until
+///   told to go on.
+/// - Deletes go through a batching deleter; `batched` records that a batch
+///   ran.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Versioned {
     generation: Arc<Mutex<String>>,
@@ -314,10 +320,7 @@ impl Versioned {
 
     /// Note the condition a copy or delete of a real path carries.
     fn record(&self, if_version_match: Option<&str>) {
-        let expected = if_version_match.map(|version| match version {
-            "0" => ExpectedGeneration::Absent,
-            known => ExpectedGeneration::Known(known.parse().expect("a generation is a number")),
-        });
+        let expected = if_version_match.map(ExpectedGeneration::from_version_condition);
         self.seen.lock().unwrap().push(expected);
     }
 }
