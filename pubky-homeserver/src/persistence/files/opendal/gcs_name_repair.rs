@@ -1429,10 +1429,14 @@ mod tests {
         let small = b"small".to_vec();
         let large = vec![7u8; 6 * 1024 * 1024];
 
-        // Misnamed, below and above the multipart threshold: moved.
+        // Misnamed, below and above the multipart threshold: moved. The
+        // small one has a content type other than the GCS default, to check
+        // that the move keeps it.
         let moved = create_entry(&db, &user, "/pub/Teest%20share/.keep", &small).await;
+        let moved_content_type = "text/plain";
         backend
-            .write(&misnamed_object_name(&moved), small.clone())
+            .write_with(&misnamed_object_name(&moved), small.clone())
+            .content_type(moved_content_type)
             .await
             .unwrap();
         let moved_large = create_entry(&db, &user, "/pub/big file.bin", &large).await;
@@ -1499,6 +1503,8 @@ mod tests {
         ] {
             assert_eq!(&operator.read(&name).await.unwrap().to_vec(), content);
         }
+        let moved_metadata = operator.stat(moved.as_str()).await.unwrap();
+        assert_eq!(moved_metadata.content_type(), Some(moved_content_type));
         assert!(!operator
             .exists(&misnamed_object_name(&moved))
             .await
