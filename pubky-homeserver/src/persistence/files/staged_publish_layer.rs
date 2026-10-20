@@ -207,8 +207,7 @@ impl Service for StagedPublishService {
 
     fn delete(&self, ctx: &OperationContext) -> Result<Self::Deleter> {
         Ok(ConditionalDeleter {
-            inner: self.inner.clone(),
-            ctx: ctx.clone(),
+            backend: self.backend(ctx),
         })
     }
 
@@ -350,12 +349,11 @@ impl StagedWriter {
 /// so a delete executed late finds a changed object and is refused. A delete
 /// that carries a condition of its own is refused too.
 pub struct ConditionalDeleter {
-    inner: Servicer,
-    ctx: OperationContext,
+    backend: Operator,
 }
 
 impl oio::Delete for ConditionalDeleter {
-    /// Sent at once rather than queued, on a backend deleter of its own: the
+    /// Sent at once rather than queued, through a deleter of its own: the
     /// condition belongs to this one path, and a backend deleter keeps a
     /// refused path to resend it with the next.
     async fn delete(&mut self, path: &str, args: OpDelete) -> Result<()> {
@@ -365,12 +363,10 @@ impl oio::Delete for ConditionalDeleter {
         let Some(expected) = expected_generation() else {
             return Err(no_generation(path));
         };
-        let args = conditional_on(args, expected, &self.inner.capability())?;
-        let mut deleter = self.inner.delete(&self.ctx)?;
-        let deleted = match deleter.delete(path, args).await {
-            Ok(()) => deleter.close().await,
-            Err(error) => Err(error),
-        };
+        let deleted = self
+            .backend
+            .delete_options(path, conditional_on(&args, expected))
+            .await;
         refused_as_conflict(deleted, path, expected)
     }
 
@@ -388,19 +384,15 @@ fn carries_condition(args: &OpDelete) -> bool {
         || args.if_version_not_match().is_some()
 }
 
-/// `args` with the condition that the object is at `expected`.
-fn conditional_on(
-    args: OpDelete,
-    expected: ExpectedGeneration,
-    capability: &Capability,
-) -> Result<OpDelete> {
-    let options = DeleteOptions {
+/// The options of `args`, with the condition that the object is at
+/// `expected`.
+fn conditional_on(args: &OpDelete, expected: ExpectedGeneration) -> DeleteOptions {
+    DeleteOptions {
         version: args.version().map(str::to_string),
         recursive: args.recursive(),
         if_version_match: Some(expected.version_condition()),
         ..DeleteOptions::default()
-    };
-    OpDelete::from_options(capability, options)
+    }
 }
 
 /// Pass `result` on, turning a refusal of the condition into a publish
