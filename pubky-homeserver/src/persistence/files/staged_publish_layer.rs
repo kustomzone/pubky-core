@@ -347,7 +347,8 @@ impl StagedWriter {
 }
 
 /// Deleter that removes each object under the generation the task provides,
-/// so a delete executed late finds a changed object and is refused.
+/// so a delete executed late finds a changed object and is refused. A delete
+/// that carries a condition of its own is refused too.
 pub struct ConditionalDeleter {
     inner: Servicer,
     ctx: OperationContext,
@@ -358,6 +359,9 @@ impl oio::Delete for ConditionalDeleter {
     /// condition belongs to this one path, and a backend deleter keeps a
     /// refused path to resend it with the next.
     async fn delete(&mut self, path: &str, args: OpDelete) -> Result<()> {
+        if carries_condition(&args) {
+            return Err(condition_of_its_own(path));
+        }
         let Some(expected) = expected_generation() else {
             return Err(no_generation(path));
         };
@@ -373,6 +377,15 @@ impl oio::Delete for ConditionalDeleter {
     async fn close(&mut self) -> Result<()> {
         Ok(())
     }
+}
+
+/// Whether the caller put a condition on the delete. This layer sets the
+/// condition itself, so `conditional_on` would replace or drop the caller's.
+fn carries_condition(args: &OpDelete) -> bool {
+    args.if_match().is_some()
+        || args.if_none_match().is_some()
+        || args.if_version_match().is_some()
+        || args.if_version_not_match().is_some()
 }
 
 /// `args` with the condition that the object is at `expected`.
@@ -418,6 +431,16 @@ fn no_generation(path: &str) -> opendal::Error {
     opendal::Error::new(
         ErrorKind::Unsupported,
         format!("No generation to change {path} under: the backend reports none"),
+    )
+}
+
+/// The delete carries a condition of its own. It can't be combined with the
+/// generation condition: a request takes one version condition, as GCS
+/// takes one `ifGenerationMatch`.
+fn condition_of_its_own(path: &str) -> opendal::Error {
+    opendal::Error::new(
+        ErrorKind::Unsupported,
+        format!("The delete of {path} carries a condition, but the staged publish sets its own"),
     )
 }
 
@@ -587,6 +610,28 @@ mod tests {
         assert_eq!(
             versioned.seen.lock().unwrap().last(),
             Some(&Some(ExpectedGeneration::Known(7)))
+        );
+    }
+
+    /// The layer would replace or drop a condition set by the caller, so it
+    /// refuses the delete instead of sending it without that condition.
+    #[tokio::test]
+    async fn delete_with_a_condition_of_its_own_is_refused() {
+        let (operator, versioned, _tmp_dir) = staged_fs();
+        let path = "pk/pub/a.txt";
+        under_7(operator.write(path, b"kept".to_vec()))
+            .await
+            .unwrap();
+
+        let refused = under_7(async { operator.delete_with(path).if_version_match("8").await })
+            .await
+            .expect_err("a delete with a condition of its own is refused");
+        assert_eq!(refused.kind(), ErrorKind::Unsupported);
+        assert!(operator.exists(path).await.unwrap());
+        assert_eq!(
+            versioned.seen.lock().unwrap().len(),
+            1,
+            "only the write's publish"
         );
     }
 
