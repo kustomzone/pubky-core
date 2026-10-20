@@ -172,8 +172,13 @@ impl Service for StagedPublishService {
         self.inner.info()
     }
 
+    /// The backend's capability without copy, which is refused, see
+    /// [`Self::copy`].
     fn capability(&self) -> Capability {
-        self.inner.capability()
+        Capability {
+            copy: false,
+            ..self.inner.capability()
+        }
     }
 
     async fn create_dir(
@@ -554,9 +559,13 @@ mod tests {
     }
 
     /// A copy is refused: it would land without the generation condition.
+    /// The layer does not offer it either, though the backend supports it.
     #[tokio::test]
     async fn copy_is_refused() {
         let (operator, versioned, _tmp_dir) = staged_fs();
+        assert!(plain_fs().0.info().capability().copy);
+        assert!(!operator.info().capability().copy);
+
         under_7(operator.write("pk/pub/a.txt", b"a".to_vec()))
             .await
             .unwrap();
