@@ -23,18 +23,8 @@ use opendal::Operator;
 use super::super::{FileIoError, FileStream, WriteStreamError};
 
 /// Build storage operators with one transactional finalization layer and an
-/// app-facing operator that additionally enforces write paths and collisions.
-///
-/// Both operators share the same underlying storage backend, which is
-/// important for backends like `InMemory` where separate instances would
-/// have independent data.
-///
-/// A remote backend publishes and deletes under a generation condition
-/// through [`StagedPublishLayer`], so a request it executes late is refused
-/// rather than landing on a newer write. Every call to it is bounded by
-/// [`BACKEND_IO_TIMEOUT`], so a hung request cannot hold a finalization, and
-/// the user row with it, forever. A local backend's calls are not bounded:
-/// abandoning a filesystem rename would not stop it, only lose track of it.
+/// app-facing operator that additionally enforces write paths and collisions,
+/// over the backend `storage_config` names, see [`layer_storage_operators`].
 pub fn build_storage_operators(
     storage_config: &StorageToml,
     data_directory: &Path,
@@ -42,14 +32,41 @@ pub fn build_storage_operators(
     events_service: EventsService,
     user_service: UserService,
 ) -> Result<(Operator, Operator), FileIoError> {
-    let backend_operator = match &storage_config.backend {
+    let backend_operator = backend_operator(&storage_config.backend, data_directory)?;
+    Ok(layer_storage_operators(
+        backend_operator,
+        storage_config.default_quota_mb,
+        sql_db,
+        events_service,
+        user_service,
+    ))
+}
+
+/// Where the filesystem backend keeps the files, under the data directory.
+const FILE_SYSTEM_FILES_DIR: &str = "data/files";
+/// Where the filesystem backend stages uploads, under the data directory.
+pub(crate) const FILE_SYSTEM_STAGING_DIR: &str = "data/files-tmp";
+
+/// The storage backend `backend` names.
+///
+/// A remote backend publishes and deletes under a generation condition
+/// through [`StagedPublishLayer`], so a request it executes late is refused
+/// rather than landing on a newer write. Every call to it is bounded by
+/// [`BACKEND_IO_TIMEOUT`], so a hung request cannot hold a finalization, and
+/// the user row with it, forever. A local backend's calls are not bounded:
+/// abandoning a filesystem rename would not stop it, only lose track of it.
+pub(super) fn backend_operator(
+    backend: &StorageConfigToml,
+    data_directory: &Path,
+) -> Result<Operator, FileIoError> {
+    let operator = match backend {
         StorageConfigToml::FileSystem => {
-            let files_dir = data_directory.join("data/files");
+            let files_dir = data_directory.join(FILE_SYSTEM_FILES_DIR);
             // Uploads are staged here and renamed into place on close, so a
             // rejected or aborted write never touches the existing file. Must
             // be on the same filesystem as the root, and outside it so staged
             // files never show up in listings.
-            let staging_dir = data_directory.join("data/files-tmp");
+            let staging_dir = data_directory.join(FILE_SYSTEM_STAGING_DIR);
             let (Some(files_dir), Some(staging_dir)) = (files_dir.to_str(), staging_dir.to_str())
             else {
                 return Err(FileIoError::OpenDAL(opendal::Error::new(
@@ -77,14 +94,30 @@ pub fn build_storage_operators(
             opendal::Operator::new(builder)?
         }
     };
+    Ok(operator)
+}
 
+/// The app-facing and the admin operator over `backend_operator`, in that
+/// order. Both finalize every write and delete in one transaction with its
+/// entry, events and quota; the app-facing one also enforces write paths and
+/// collisions.
+///
+/// Both share `backend_operator`, which matters for backends like `InMemory`,
+/// where separate instances would have independent data.
+pub(super) fn layer_storage_operators(
+    backend_operator: Operator,
+    default_quota_mb: Option<u64>,
+    sql_db: SqlDb,
+    events_service: EventsService,
+    user_service: UserService,
+) -> (Operator, Operator) {
     // Collision checks apply only to app-facing mutations, so each operator
     // needs its own finalization layer.
     let admin_operator = backend_operator.clone().layer(WriteFinalizationLayer::new(
         user_service.clone(),
         sql_db.clone(),
         events_service.clone(),
-        storage_config.default_quota_mb,
+        default_quota_mb,
         false,
     ));
     let operator = backend_operator
@@ -92,11 +125,11 @@ pub fn build_storage_operators(
             user_service.clone(),
             sql_db,
             events_service,
-            storage_config.default_quota_mb,
+            default_quota_mb,
             true,
         ))
         .layer(WritePathLayer::new(user_service));
-    Ok((operator, admin_operator))
+    (operator, admin_operator)
 }
 
 /// Longest any one call to the remote backend may take before it is
@@ -142,7 +175,7 @@ pub(super) fn gcs_unstaged_backend(
 /// their own. The production GCS operator gets one too, through
 /// [`gcs_unstaged_backend`], so it runs on the client the real-bucket tests
 /// check. One client per operator costs nothing there.
-#[cfg(any(feature = "storage-gcs", test))]
+#[cfg(feature = "storage-gcs")]
 pub(super) fn with_own_http_client(operator: Operator) -> Operator {
     let transport = opendal_http_transport_reqwest::ReqwestTransport::new(reqwest::Client::new());
     operator.with_context(
@@ -333,8 +366,8 @@ impl OpendalService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistence::files::opendal::opendal_test_operators::{
-        get_fs_operator, get_memory_operator, CountingReads, OpendalTestOperators, Versioned,
+    use crate::persistence::files::test_support::{
+        get_fs_operator, get_memory_operator, CountingReads, Versioned,
     };
     use crate::shared::webdav::StoragePath;
 
@@ -367,36 +400,6 @@ mod tests {
             .await
             .unwrap()
             .expect_err("a read of another version of the blob is refused");
-    }
-
-    /// An overwrite landing mid-download does not mix the two versions: the
-    /// download completes the version it opened.
-    #[tokio::test]
-    async fn an_overwrite_mid_download_does_not_mix_versions() {
-        let (fs, _tmp_dir) = get_fs_operator();
-        let service = OpendalService::new_from_operator(fs);
-        let path = EntryPath::new(
-            pubky_common::crypto::Keypair::random().public_key(),
-            StoragePath::new("/pub/a.bin").unwrap(),
-        );
-        // Larger than the filesystem backend's 2 MiB read buffer, so the
-        // download is more than one stream item.
-        let length = 3 * 1024 * 1024;
-        service.write(&path, vec![1u8; length]).await.unwrap();
-
-        let (_, mut stream) = service.get_sized_stream(&path).await.unwrap();
-        let mut delivered = stream.next().await.unwrap().unwrap().to_vec();
-        assert!(delivered.len() < length, "the download is still going");
-
-        service.write(&path, vec![2u8; length]).await.unwrap();
-        while let Some(chunk) = stream.next().await {
-            delivered.extend_from_slice(&chunk.unwrap());
-        }
-        assert_eq!(delivered, vec![1u8; length]);
-        assert_eq!(
-            service.get(&path).await.unwrap().to_vec(),
-            vec![2u8; length]
-        );
     }
 
     /// A download is one read of the backend, whatever the blob's size. On
@@ -435,6 +438,87 @@ mod tests {
         assert!(!service.exists(&path).await.unwrap());
     }
 
+    /// A homeserver configured with `file_system` storage stores a file at
+    /// the longest storage path.
+    #[tokio::test]
+    #[ignore = "fails on the file system backend, see #715 and #716"]
+    #[pubky_test_utils::test]
+    async fn file_system_stores_a_file_at_the_longest_storage_path() {
+        let context = AppContext::test_with_config(|c| {
+            c.storage.backend = StorageConfigToml::FileSystem;
+        })
+        .await;
+        let user = pubky_common::crypto::Keypair::random().public_key();
+
+        stores_and_removes_files(&context, &user, &[&longest_storage_path()]).await;
+    }
+
+    /// Against the real bucket, see
+    /// [`gcs_test_bucket`](crate::persistence::files::test_support::gcs_test_bucket):
+    /// a homeserver configured with `google_bucket` storage stores files
+    /// through the code production builds its backend with, also at the
+    /// longest storage path. In the bucket's root, the user's key and that
+    /// path take up the whole object name GCS allows.
+    // Multi-threaded for the cleaner, which blocks on its async drop.
+    #[cfg(feature = "storage-gcs")]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs GCS_BUCKET and GOOGLE_APPLICATION_CREDENTIALS"]
+    #[pubky_test_utils::test]
+    async fn gcs_stores_files_from_the_google_bucket_config() {
+        use crate::persistence::files::test_support::TestBucket;
+
+        let bucket = TestBucket::from_env();
+        let user = pubky_common::crypto::Keypair::random().public_key();
+        // The homeserver stores in the bucket's root, under its users' keys.
+        let _cleaner = bucket.user_cleaner(&user);
+        let context = AppContext::test_with_config(|c| {
+            c.storage.backend = StorageConfigToml::GoogleBucket(bucket.config());
+        })
+        .await;
+
+        stores_and_removes_files(&context, &user, &["/pub/a.txt", &longest_storage_path()]).await;
+    }
+
+    /// Signs `user` up on the homeserver of `context`, then writes, reads
+    /// back and deletes a file at each of `paths` through its storage.
+    async fn stores_and_removes_files(
+        context: &AppContext,
+        user: &pubky_common::crypto::PublicKey,
+        paths: &[&str],
+    ) {
+        let service = OpendalService::new(context).unwrap();
+        context.user_service.create(user).await.unwrap();
+        for path in paths {
+            let path = EntryPath::new(user.clone(), StoragePath::new(path).unwrap());
+            let content = path.as_str().as_bytes().to_vec();
+
+            service.write(&path, content.clone()).await.unwrap();
+            assert_eq!(service.get(&path).await.unwrap().to_vec(), content);
+
+            service.delete(&path).await.unwrap();
+            assert!(!service.exists(&path).await.unwrap());
+        }
+    }
+
+    /// A path of the longest total length, whose last segments, the file
+    /// name among them, are of the longest segment length.
+    fn longest_storage_path() -> String {
+        use pubky_common::storage_path::{
+            MAX_STORAGE_PATH_SEGMENT_LENGTH, MAX_STORAGE_PATH_TOTAL_LENGTH,
+        };
+
+        let longest_segment = format!("/{}", "a".repeat(MAX_STORAGE_PATH_SEGMENT_LENGTH));
+        let filler_length =
+            MAX_STORAGE_PATH_TOTAL_LENGTH - "/pub/".len() - 3 * longest_segment.len();
+        let path = format!(
+            "/pub/{}{}",
+            "b".repeat(filler_length),
+            longest_segment.repeat(3)
+        );
+        assert_eq!(path.len(), MAX_STORAGE_PATH_TOTAL_LENGTH);
+        path
+    }
+
     /// Make sure that the OpendalService returns a DiskSpaceQuotaExceeded error if the user has exceeded the quota.
     /// This is important because write finalization returns a RateLimited error if the user has exceeded the quota.
     #[tokio::test]
@@ -454,145 +538,34 @@ mod tests {
         ));
     }
 
-    /// A body that breaks mid-stream is aborted, and the caller gets the
-    /// stream error rather than a cleanup error.
-    #[tokio::test]
-    #[pubky_test_utils::test]
-    async fn broken_stream_leaves_no_staged_file_and_the_old_bytes() {
-        let context = AppContext::test_with_config(|c| {
-            c.storage.backend = StorageConfigToml::FileSystem;
-        })
-        .await;
-        let service = OpendalService::new(&context).unwrap();
-        let pubky = pubky_common::crypto::Keypair::random().public_key();
-        context.user_service.create(&pubky).await.unwrap();
-        let path = EntryPath::new(pubky, StoragePath::new("/pub/test.txt").unwrap());
-        service.write(&path, b"old".to_vec()).await.unwrap();
-        let staging_dir = context.data_dir.path().join("data/files-tmp");
-
-        let stream = futures_util::stream::iter([
-            Ok(Bytes::from_static(b"partial")),
-            Err(WriteStreamError::Other(anyhow::anyhow!("connection reset"))),
-        ]);
-        let result = service.write_stream(&path, Box::pin(stream)).await;
-
-        assert!(matches!(result, Err(FileIoError::StreamBroken(_))));
-        assert_eq!(std::fs::read_dir(&staging_dir).unwrap().count(), 0);
-        assert_eq!(
-            service.get(&path).await.unwrap(),
-            Bytes::from_static(b"old")
-        );
-    }
-
-    /// Test the streamed reading of a file.
-    // Multi-threaded for the cleaner, which blocks on its async drop.
-    #[tokio::test(flavor = "multi_thread")]
-    #[pubky_test_utils::test]
-    async fn test_get_content_streamed() {
-        let operators = OpendalTestOperators::new();
-        for (_scheme, operator) in operators.operators() {
-            let file_service = OpendalService::new_from_operator(operator);
-
-            let pubkey = pubky_common::crypto::Keypair::random().public_key();
-            let path = EntryPath::new(pubkey, StoragePath::new("/test.txt").unwrap());
-
-            let test_data = vec![42u8; 5 * TEST_CHUNK_SIZE];
-            file_service.write(&path, test_data.clone()).await.unwrap();
-
-            let mut stream = file_service.get_stream(&path).await.unwrap();
-            let mut collected_data = Vec::new();
-            while let Some(chunk_result) = stream.next().await {
-                collected_data.extend_from_slice(&chunk_result.unwrap());
-            }
-            assert_eq!(
-                collected_data, test_data,
-                "Content should match original data"
-            );
-
-            file_service
-                .delete(&path)
-                .await
-                .expect("Should delete file");
-            assert!(
-                !file_service.exists(&path).await.unwrap(),
-                "File should not exist after deletion"
-            );
-        }
-    }
-
-    /// The length and the stream come from the same `stat`, and a missing
-    /// blob fails before a reader is opened.
-    // Multi-threaded for the cleaner, which blocks on its async drop.
-    #[tokio::test(flavor = "multi_thread")]
-    #[pubky_test_utils::test]
-    async fn test_get_sized_stream() {
-        let operators = OpendalTestOperators::new();
-        for (_scheme, operator) in operators.operators() {
-            let file_service = OpendalService::new_from_operator(operator);
-            let pubkey = pubky_common::crypto::Keypair::random().public_key();
-            let path = EntryPath::new(pubkey, StoragePath::new("/sized.bin").unwrap());
-
-            assert!(matches!(
-                file_service.get_sized_stream(&path).await,
-                Err(FileIoError::NotFound)
-            ));
-
-            let test_data = vec![7u8; TEST_CHUNK_SIZE + 1];
-            file_service.write(&path, test_data.clone()).await.unwrap();
-
-            let (length, mut stream) = file_service.get_sized_stream(&path).await.unwrap();
-            let mut collected_data = Vec::new();
-            while let Some(chunk_result) = stream.next().await {
-                collected_data.extend_from_slice(&chunk_result.unwrap());
-            }
-            assert_eq!(length, test_data.len() as u64);
-            assert_eq!(collected_data, test_data);
-
-            file_service.delete(&path).await.unwrap();
-        }
-    }
-
-    /// Against a real bucket, when `GOOGLE_APPLICATION_CREDENTIALS` and
-    /// `GCS_BUCKET` are set: a path with characters that URLs percent-encode
-    /// is stored under its own name, below and above the 5 MiB multipart
-    /// threshold, so it can be read back. That holds for a write through the
+    /// Against the real bucket, see
+    /// [`gcs_test_bucket`](crate::persistence::files::test_support::gcs_test_bucket): a path with
+    /// characters that URLs percent-encode is stored under its own name,
+    /// below and above the 5 MiB multipart threshold, so it can be read back. That holds for a write through the
     /// staged publish and for an upload straight to the path.
     ///
     /// Up to opendal 0.57, an upload straight to such a path landed under
     /// the path percent-encoded once, where nothing finds it, see
     /// [`gcs_name_repair`](super::super::gcs_name_repair). opendal 0.58.1
     /// encodes the name of an upload once.
-    // Multi-threaded for the cleaner, which deletes the test root on drop.
+    // Multi-threaded for the cleaner, which blocks on its async drop.
     #[cfg(feature = "storage-gcs")]
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs GCS_BUCKET and GOOGLE_APPLICATION_CREDENTIALS"]
     async fn gcs_stores_paths_with_special_characters_under_their_own_name() {
-        use async_dropper::AsyncDropper;
-
-        use crate::persistence::files::opendal::opendal_test_operators::OpendalGcpCleaner;
         use crate::persistence::files::staged_publish_layer::{
             under_expected_generation, ExpectedGeneration, STAGING_PREFIX,
         };
+        use crate::persistence::files::test_support::TestBucket;
 
-        let (Ok(bucket), Ok(credentials)) = (
-            std::env::var("GCS_BUCKET"),
-            std::env::var("GOOGLE_APPLICATION_CREDENTIALS"),
-        ) else {
-            eprintln!("GCS_BUCKET or GOOGLE_APPLICATION_CREDENTIALS not set; skipping");
-            return;
-        };
-        let root = format!("test_{}", uuid::Uuid::new_v4());
-        let builder = || {
-            opendal::services::Gcs::default()
-                .bucket(&bucket)
-                .credential_path(&credentials)
-                .root(&root)
-        };
-        let service = OpendalService::new_from_operator(gcs_operator(builder()).unwrap());
+        let bucket = TestBucket::from_env();
+        let _cleaner = bucket.test_root_cleaner();
+        let service =
+            OpendalService::new_from_operator(gcs_operator(bucket.test_root_builder()).unwrap());
         // The bare backend, to upload straight to a path and to see the names
         // the objects are stored under.
-        let backend = with_own_http_client(opendal::Operator::new(builder()).unwrap());
-        // Removes the test root from the bucket on drop.
-        let _cleaner = AsyncDropper::new(OpendalGcpCleaner::new(Some(backend.clone())));
+        let backend =
+            with_own_http_client(opendal::Operator::new(bucket.test_root_builder()).unwrap());
         let pubkey = pubky_common::crypto::Keypair::random().public_key();
         let small = 1024;
         let large = 6 * 1024 * 1024;
@@ -653,8 +626,9 @@ mod tests {
         assert_eq!(stored, expected);
     }
 
-    /// Against a real bucket, when `GOOGLE_APPLICATION_CREDENTIALS` and
-    /// `GCS_BUCKET` are set, the production stack end to end:
+    /// Against the real bucket, see
+    /// [`gcs_test_bucket`](crate::persistence::files::test_support::gcs_test_bucket), the production
+    /// stack end to end:
     ///
     /// 1. Writes land through staging, below and above the 5 MiB multipart
     ///    threshold, and leave no staging object behind.
@@ -663,38 +637,23 @@ mod tests {
     ///    stays.
     /// 3. A read returns one version of the object or fails, never bytes of
     ///    two: an overwrite between two chunks ends the stream.
-    // Multi-threaded for the cleaner, which deletes the test root on drop.
+    // Multi-threaded for the cleaner, which blocks on its async drop.
     #[cfg(feature = "storage-gcs")]
     #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs GCS_BUCKET and GOOGLE_APPLICATION_CREDENTIALS"]
     async fn gcs_refuses_stale_changes_and_mixed_reads() {
-        use async_dropper::AsyncDropper;
-
         use crate::persistence::files::layer_domain_error::LayerDomainError;
-        use crate::persistence::files::opendal::opendal_test_operators::OpendalGcpCleaner;
         use crate::persistence::files::staged_publish_layer::{
             live_generation, staging_objects, under_expected_generation, ExpectedGeneration,
         };
+        use crate::persistence::files::test_support::TestBucket;
 
-        let (Ok(bucket), Ok(credentials)) = (
-            std::env::var("GCS_BUCKET"),
-            std::env::var("GOOGLE_APPLICATION_CREDENTIALS"),
-        ) else {
-            eprintln!("GCS_BUCKET or GOOGLE_APPLICATION_CREDENTIALS not set; skipping");
-            return;
-        };
-        let root = format!("test_{}", uuid::Uuid::new_v4());
-        let builder = || {
-            opendal::services::Gcs::default()
-                .bucket(&bucket)
-                .credential_path(&credentials)
-                .root(&root)
-        };
+        let bucket = TestBucket::from_env();
+        let _cleaner = bucket.test_root_cleaner();
         // The production stack, and the backend under its staged publish,
         // through which the late requests below are sent.
-        let operator = gcs_operator(builder()).unwrap();
-        let backend = gcs_unstaged_backend(builder()).unwrap();
-        // Removes the test root from the bucket on drop.
-        let _cleaner = AsyncDropper::new(OpendalGcpCleaner::new(Some(backend.clone())));
+        let operator = gcs_operator(bucket.test_root_builder()).unwrap();
+        let backend = gcs_unstaged_backend(bucket.test_root_builder()).unwrap();
         let entry_path = EntryPath::new(
             pubky_common::crypto::Keypair::random().public_key(),
             StoragePath::new("/pub/a.bin").unwrap(),
@@ -813,59 +772,5 @@ mod tests {
             .unwrap();
         assert!(!operator.exists(path).await.unwrap());
         assert_eq!(staging_objects(&operator).await, 0);
-    }
-
-    // Multi-threaded for the cleaner, which blocks on its async drop.
-    #[tokio::test(flavor = "multi_thread")]
-    #[pubky_test_utils::test]
-    async fn test_write_content_stream() {
-        let operators = OpendalTestOperators::new();
-        for (_scheme, operator) in operators.operators() {
-            let file_service = OpendalService::new_from_operator(operator);
-
-            let pubkey = pubky_common::crypto::Keypair::random().public_key();
-            let path = EntryPath::new(pubkey, StoragePath::new("/test_stream.txt").unwrap());
-
-            // Create test data - multiple chunks to test streaming
-            let chunk_count = 3;
-            let mut test_data = Vec::new();
-            let mut chunks = Vec::new();
-
-            // Create chunks with different patterns to verify order
-            for i in 0..chunk_count {
-                let chunk_data = vec![i as u8; TEST_CHUNK_SIZE];
-                test_data.extend_from_slice(&chunk_data);
-                chunks.push(Ok(Bytes::from(chunk_data)));
-            }
-
-            // Create a stream from the chunks
-            let stream = futures_util::stream::iter(chunks);
-
-            // Write the stream to storage
-            file_service.write_stream(&path, stream).await.unwrap();
-
-            // Read the content back and verify it matches
-            let read_content = file_service.get(&path).await.unwrap();
-
-            assert_eq!(
-                read_content.len(),
-                test_data.len(),
-                "Content length should match"
-            );
-            assert_eq!(
-                read_content.to_vec(),
-                test_data,
-                "Content should match original data"
-            );
-
-            file_service
-                .delete(&path)
-                .await
-                .expect("Should delete file");
-            assert!(
-                !file_service.exists(&path).await.unwrap(),
-                "File should not exist after deletion"
-            );
-        }
     }
 }

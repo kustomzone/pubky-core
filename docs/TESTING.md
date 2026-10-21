@@ -97,6 +97,69 @@ TEST_PUBKY_CONNECTION_STRING='postgres://postgres:postgres@localhost:5432/postgr
   cargo test -p e2e
 ```
 
+## Storage Backend Tests
+
+Most tests run on the in-memory storage backend. The storage contract covers
+the backends a homeserver runs on in production: what the file service
+promises on every backend, such as overwrites, deletes, names that URLs
+percent-encode, empty files, multipart-sized writes, broken uploads, and
+downloads during an overwrite. Each case runs as a test of its own on each
+backend, under the layers production puts on it. The tests are named
+`memory::<case>`, `file_system::<case>`, and `gcs::<case>`. To add a case,
+list it in `storage_contract_tests!` in
+[`storage_contract.rs`](../pubky-homeserver/src/persistence/files/opendal/storage_contract.rs).
+
+The tests need PostgreSQL, see [PostgreSQL for Tests](#postgresql-for-tests).
+To run the tests of one backend, filter by its name. Use `memory` or
+`file_system`; the GCS tests need a bucket, see
+[Google Cloud Storage](#google-cloud-storage).
+
+```bash
+TEST_PUBKY_CONNECTION_STRING='postgres://postgres:postgres@localhost:5432/postgres' \
+  cargo nextest run -p pubky-homeserver --all-features -E 'test(/::file_system::/)'
+```
+
+In CI, the [Test](../.github/workflows/test.yml) workflow runs them as one
+check per backend: `storage (memory)`, `storage (file_system)`, and
+`storage (gcs)`. It runs on pull requests, on pushes to `main`, and on demand.
+
+### Google Cloud Storage
+
+The GCS tests run against a real bucket. They are marked `#[ignore]`, so
+`cargo test` stays offline, and each has `gcs` in its name. To run them, set
+both environment variables:
+
+| Variable | Value |
+| --- | --- |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Path to a service account JSON key |
+| `GCS_BUCKET` | Name of the bucket |
+
+```bash
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/key.json \
+GCS_BUCKET=my-test-bucket \
+TEST_PUBKY_CONNECTION_STRING='postgres://postgres:postgres@localhost:5432/postgres' \
+  cargo nextest run -p pubky-homeserver --all-features \
+    --run-ignored only -E 'test(/gcs/)'
+```
+
+A GCS test fails if a variable is missing, rather than passing without the
+bucket. Each test works under a prefix of its own and deletes it when it
+finishes, so tests can share a bucket and run in parallel. The prefix is
+`ci/<run id>/<uuid>` in GitHub Actions and `test_<uuid>` otherwise. The test
+of the `google_bucket` config works in the bucket's root instead, under its
+user's key, because the config has no root of its own.
+
+Use a dedicated bucket. Give the service account only the
+**Storage Object User** role on that bucket. Add lifecycle rules that delete
+objects and incomplete multipart uploads older than one day, so that what a
+killed test leaves behind is removed.
+
+In CI, `storage (gcs)` reads the key from the `GCS_CI_CREDENTIALS` secret and
+the bucket name from the `GCS_CI_BUCKET` variable. Pull requests from forks
+and Dependabot don't get the secret, so the check passes with a warning
+without running the tests; the push to `main` runs them after the merge.
+Outside pull requests, a missing secret fails the check.
+
 ## Docker Build Options
 
 The root [Dockerfile](../Dockerfile) builds either a homeserver or a testnet image. Run the commands below from the repository root.
@@ -132,7 +195,7 @@ to build both `homeserver` and `testnet` images.
 
 | Workflow | Trigger | Profile | Platforms | Publishes images |
 | --- | --- | --- | --- | --- |
-| [PR Check](../.github/workflows/pr-check.yml) | Pull requests and pushes to `main` | `debug` | `linux/amd64` (native runner) | No |
+| [Build](../.github/workflows/build.yml) | Pull requests and pushes to `main` | `debug` | `linux/amd64` (native runner) | No |
 | [Release Docker check](../.github/workflows/docker-check.yml) | Pushes to `main` | `release` | `linux/amd64`, `linux/arm64` (native runners) | No |
 | [Docker publishing](../.github/workflows/docker.yml) | Tags matching `v*` | `release` | `linux/amd64`, `linux/arm64` | Yes |
 
@@ -144,9 +207,14 @@ Checks use native runners: `ubuntu-24.04` for AMD64 and `ubuntu-24.04-arm` for A
 ARM64 is checked only after merging to `main`. Publishing runs on `ubuntu-latest`
 with ARM64 emulation.
 
-Caches use the scope `docker-<profile>-<target>-<architecture>`. Checks import and
-update their cache, with debug builds on `main` warming caches for PRs. Publishing
-imports both architecture-specific release caches from `main` without exporting.
+The [Dockerfile](../Dockerfile) builds the dependencies with
+[cargo-chef](https://github.com/LukeMathWalker/cargo-chef) in a layer of their
+own, so a build with cached dependencies compiles only the workspace crates.
+
+Caches use the scope `docker-<profile>-<target>-<architecture>`. Checks on `main`
+import and update their cache, and the debug builds on `main` warm the caches for
+PRs. PRs import the cache without exporting. Publishing imports both
+architecture-specific release caches from `main` without exporting.
 
 ## Common Commands
 

@@ -8,4 +8,6 @@
 pub(crate) mod gcs_name_repair;
 pub mod opendal_service;
 #[cfg(test)]
-pub(crate) mod opendal_test_operators;
+mod storage_contract;
+#[cfg(test)]
+pub(crate) mod test_support;

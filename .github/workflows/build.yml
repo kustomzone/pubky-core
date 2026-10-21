@@ -1,0 +1,59 @@
+name: Build
+
+# Documentation, examples and Docker images.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A new push to a pull request cancels its older runs. Runs on main finish, so
+# they save the caches that pull requests restore.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# The Rust caches are saved only on main. Pull requests restore them without
+# saving, so they don't evict the caches of main from the repository's cache.
+jobs:
+  doc:
+    name: docs (${{ matrix.crate }})
+    strategy:
+      matrix:
+        crate: [pubky, pubky-testnet]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.91"
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.crate }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build docs
+        run: cargo doc -p ${{ matrix.crate }} --all-features --no-deps
+
+  examples:
+    name: examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.91"
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Cargo check examples
+        run: |
+          cargo check -p pubky-homeserver-examples --all-features --bins
+
+  docker-build:
+    name: docker
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      build_profile: debug

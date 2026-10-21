@@ -471,7 +471,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::persistence::files::opendal::opendal_test_operators::Versioned;
+    use crate::persistence::files::test_support::Versioned;
     use crate::persistence::files::write_finalization_layer::test_support::{
         create_user, test_operator_over,
     };
