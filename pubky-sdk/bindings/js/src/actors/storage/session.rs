@@ -7,6 +7,8 @@ use web_sys::Response;
 
 use super::stats::ResourceStats;
 use crate::js_error::{JsResult, serialize_ts};
+#[cfg(target_arch = "wasm32")]
+use crate::js_error::{PubkyError, PubkyErrorName};
 
 #[wasm_bindgen(typescript_custom_section)]
 const TS_PATH: &'static str = r#"export type Path = `/pub/${string}` | `/priv/${string}`;"#;
@@ -162,6 +164,25 @@ impl SessionStorage {
         Ok(())
     }
 
+    /// Upload a Blob or File without copying its contents into WASM memory.
+    ///
+    /// @param {Path} path File path; must not end with `/`.
+    /// @param {Blob} body A Blob or File to upload.
+    /// @returns {Promise<void>}
+    /// @throws {PubkyError} `InvalidInput` if body is not a Blob or File;
+    /// otherwise upload or shared write/request errors (see {@link SessionStorage}).
+    /// @example
+    /// await session.storage.putBlob("/pub/example.com/file.bin", file);
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = "putBlob")]
+    pub async fn put_blob(
+        &self,
+        #[wasm_bindgen(unchecked_param_type = "Path")] path: String,
+        body: &web_sys::Blob,
+    ) -> JsResult<()> {
+        self.put_blob_inner(&path, body, None).await
+    }
+
     /// Create or replace a file with text at an absolute session path.
     ///
     /// @param {Path} path File path; must not end with `/`.
@@ -209,5 +230,33 @@ impl SessionStorage {
     ) -> JsResult<()> {
         self.0.delete(path).await?;
         Ok(())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl SessionStorage {
+    pub(super) async fn put_blob_inner(
+        &self,
+        path: &str,
+        body: &web_sys::Blob,
+        if_header: Option<&str>,
+    ) -> JsResult<()> {
+        if !body.is_instance_of::<web_sys::Blob>() {
+            return Err(PubkyError::new(
+                PubkyErrorName::InvalidInput,
+                "body must be a Blob or File",
+            ));
+        }
+        let mut retried = false;
+        loop {
+            let (request, limit, lease) = self.0.prepare_blob_put(path).await?;
+            let response = super::utils::send_blob_put(&request, body, if_header).await?;
+            drop(lease);
+            if !retried && response.status() == 401 && self.0.retry_blob_put(&request).await? {
+                retried = true;
+                continue;
+            }
+            return super::utils::check_web_http_status(response, limit).await;
+        }
     }
 }
