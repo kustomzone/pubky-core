@@ -54,6 +54,22 @@ independent sessions: those clients can invalidate each other's bearers.
 Browser applications should use the browser store. Requests made with a manually
 copied bearer or by older SDKs are outside this coordination.
 
+Native session-managed requests and WASM Blob uploads with local grants can
+recover from an unexpected 401. The SDK coordinates refresh across clones of
+the same credential and retries the original replayable HTTP request once with
+the refreshed bearer. It does not
+replay non-cloneable bodies, transport failures, other HTTP errors, or a second
+401. A rejected refresh is returned as `Error::CredentialRefresh`, including
+the HTTP status when available; a revoked grant cannot regain access this way.
+This does not coordinate independent applications or replay an interrupted
+application operation. Callers must reconcile uncertain mutation outcomes
+before retrying their own work.
+
+Rust `PubkySession::revalidate` uses the same bounded recovery before reporting
+a grant as absent. It returns `None` for a confirmed 401/404 from the refresh
+exchange or the final session response; transport, permission and service
+failures remain errors rather than evidence that the session is missing.
+
 ## Upgrading stored browser sessions
 
 Existing grant records remain readable. On first restore, the SDK exchanges the

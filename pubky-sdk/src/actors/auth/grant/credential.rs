@@ -516,14 +516,24 @@ impl GrantCredential {
                 .refresh_shared(client, coordinator.as_ref(), None)
                 .await;
         }
-        cross_log!(info, "Refreshing grant credential");
+        self.refresh_local(client, None).await
+    }
+
+    async fn refresh_local(
+        &self,
+        client: &PubkyHttpClient,
+        rejected_bearer: Option<&str>,
+    ) -> Result<()> {
         let mut state = self.state.lock().await;
 
-        // Another caller may have refreshed while we waited for the lock.
-        if !state.needs_refresh(now_unix(), REFRESH_SLACK_SECS / 2) {
+        // A rejection for an older bearer must not invalidate a concurrent refresh.
+        if !state.needs_refresh(now_unix(), REFRESH_SLACK_SECS / 2)
+            && rejected_bearer != Some(state.bearer.as_str())
+        {
             return Ok(());
         }
 
+        cross_log!(info, "Refreshing grant credential");
         let parsed = refresh_grant_session(
             client,
             &state.grant_jws,
@@ -536,6 +546,18 @@ impl GrantCredential {
         state.bearer = parsed.token;
         state.session = parsed.session;
         Ok(())
+    }
+
+    async fn bearer_for_request(&self, client: &PubkyHttpClient) -> Result<String> {
+        let needs_refresh = self
+            .state
+            .lock()
+            .await
+            .needs_refresh(now_unix(), REFRESH_SLACK_SECS);
+        if needs_refresh {
+            self.refresh(client).await?;
+        }
+        Ok(self.current_bearer().await)
     }
 
     async fn grant_session_request(
@@ -622,21 +644,26 @@ impl SessionCredential for GrantCredential {
         if let Some(coordinator) = self.coordinator().await {
             return self.send_shared(rb, client, coordinator.as_ref()).await;
         }
-        Ok(self.attach(rb, client).await?.send().await?)
+        let retry = rb.try_clone();
+        let bearer = self.bearer_for_request(client).await?;
+        let response = rb.bearer_auth(&bearer).send().await?;
+        if response.status() == StatusCode::UNAUTHORIZED
+            && let Some(retry) = retry
+        {
+            // Authentication rejects this request before a storage mutation runs.
+            // Transport failures and non-replayable bodies never enter this path.
+            drop(response.bytes_stream());
+            self.refresh_local(client, Some(&bearer)).await?;
+            return Ok(retry
+                .bearer_auth(self.current_bearer().await)
+                .send()
+                .await?);
+        }
+        Ok(response)
     }
 
     async fn attach(&self, rb: RequestBuilder, client: &PubkyHttpClient) -> Result<RequestBuilder> {
-        // Snapshot expiry quickly so we don't hold the lock across the
-        // network call when no refresh is needed.
-        let needs_refresh = {
-            let grant_state = self.state.lock().await;
-            grant_state.needs_refresh(now_unix(), REFRESH_SLACK_SECS)
-        };
-        if needs_refresh {
-            self.refresh(client).await?;
-        }
-        let bearer = self.state.lock().await.bearer.clone();
-        Ok(rb.bearer_auth(bearer))
+        Ok(rb.bearer_auth(self.bearer_for_request(client).await?))
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -660,11 +687,12 @@ impl SessionCredential for GrantCredential {
         bearer: &str,
         client: &PubkyHttpClient,
     ) -> Result<bool> {
-        let Some(coordinator) = self.coordinator().await else {
-            return Ok(false);
-        };
-        self.refresh_shared(client, coordinator.as_ref(), Some(bearer))
-            .await?;
+        if let Some(coordinator) = self.coordinator().await {
+            self.refresh_shared(client, coordinator.as_ref(), Some(bearer))
+                .await?;
+        } else {
+            self.refresh_local(client, Some(bearer)).await?;
+        }
         Ok(true)
     }
 
@@ -678,24 +706,13 @@ impl SessionCredential for GrantCredential {
         _user: &PublicKey,
     ) -> Result<Option<SessionInfo>> {
         let request = self.grant_session_request(client, Method::GET).await?;
-        let response = if let Some(coordinator) = self.coordinator().await {
-            // A shared send only checks HTTP status inside the refresh
-            // exchange, so a rejected refresh is how the server reports a
-            // missing session before the GET itself is answered.
-            match self
-                .send_shared(request, client, coordinator.as_ref())
-                .await
-            {
-                Err(Error::CredentialRefresh(CredentialRefreshError::Request {
-                    status: Some(StatusCode::UNAUTHORIZED | StatusCode::NOT_FOUND),
-                })) => return Ok(None),
-                result => result?,
-            }
-        } else {
-            request
-                .bearer_auth(self.current_bearer().await)
-                .send()
-                .await?
+        // A rejected refresh is how the server reports a missing grant before
+        // the session GET itself is answered.
+        let response = match self.send(request, client).await {
+            Err(Error::CredentialRefresh(CredentialRefreshError::Request {
+                status: Some(StatusCode::UNAUTHORIZED | StatusCode::NOT_FOUND),
+            })) => return Ok(None),
+            result => result?,
         };
         if credential_session_missing(&response) {
             return Ok(None);
@@ -872,6 +889,7 @@ pub(crate) async fn sign_pop_for_grant(
 mod tests {
     use std::{num::NonZeroUsize, time::Duration};
 
+    use httpmock::MockServer;
     use pkarr::{Cache, InMemoryCache, SignedPacket, dns::rdata::SVCB};
     use pubky_common::{
         auth::jws::{ClientId, GRANT_JWS_TYP, GrantId},
@@ -1466,31 +1484,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_revalidation_treats_wrapped_missing_refresh_sessions_as_absent() {
-        for (status, reason) in [(401, "Unauthorized"), (404, "Not Found")] {
-            let response =
-                format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 7\r\n\r\nprivate");
-            let fixture =
-                RequestFailureFixture::new(TestServerBehavior::Reply(response.into_bytes())).await;
-            let credential = fixture.grant_credential(true);
-            let shared = SharedGrantSession {
-                response: credential.state.lock().await.response(),
-                refresh_pending: false,
-                logout_pending: false,
-            };
-            credential.state.lock().await.coordinator = Some(Arc::new(TestCoordinator {
-                shared: Arc::new(tokio::sync::Mutex::new(Some(shared))),
-            }));
+    async fn revalidation_distinguishes_missing_grants_from_refresh_failures() {
+        for shared in [false, true] {
+            for (status, reason) in [
+                (401, "Unauthorized"),
+                (404, "Not Found"),
+                (403, "Forbidden"),
+                (503, "Service Unavailable"),
+            ] {
+                let response =
+                    format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 7\r\n\r\nprivate");
+                let fixture =
+                    RequestFailureFixture::new(TestServerBehavior::Reply(response.into_bytes()))
+                        .await;
+                let credential = fixture.grant_credential(true);
+                if shared {
+                    let session = SharedGrantSession {
+                        response: credential.state.lock().await.response(),
+                        refresh_pending: false,
+                        logout_pending: false,
+                    };
+                    credential.state.lock().await.coordinator = Some(Arc::new(TestCoordinator {
+                        shared: Arc::new(tokio::sync::Mutex::new(Some(session))),
+                    }));
+                }
 
-            let result = credential
-                .revalidate(&fixture.client, &fixture.user.public_key())
-                .await;
-
-            assert!(
-                matches!(result, Ok(None)),
-                "wrapped {status} refresh failure must mean missing session, got {result:?}"
-            );
+                let result = credential
+                    .revalidate(&fixture.client, &fixture.user.public_key())
+                    .await;
+                if status == 401 || status == 404 {
+                    assert!(
+                        matches!(result, Ok(None)),
+                        "{status} refresh rejection must mean missing session, got {result:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(result, Err(Error::CredentialRefresh(CredentialRefreshError::Request { status: Some(code) })) if code.as_u16() == status),
+                        "{status} refresh failure must remain an error"
+                    );
+                }
+            }
         }
+    }
+
+    #[tokio::test]
+    async fn revalidation_does_not_treat_uncertain_refresh_as_absence() {
+        let fixture = RequestFailureFixture::new(TestServerBehavior::Reply(
+            b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n".to_vec(),
+        ))
+        .await;
+        let credential = fixture.grant_credential(false);
+
+        // The one-shot server rejects GET, then closes before the refresh exchange.
+        let result = credential
+            .revalidate(&fixture.client, &fixture.user.public_key())
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::CredentialRefresh(CredentialRefreshError::Request {
+                status: None
+            }))
+        ));
     }
 
     #[tokio::test]
@@ -1527,6 +1582,148 @@ mod tests {
                 Error::Request(RequestError::Transport(ref source)) if source.is_timeout()
             ));
         }
+    }
+
+    #[tokio::test]
+    async fn rejected_native_bearer_refreshes_once_across_concurrent_requests() {
+        for (retry_status, request_count) in [(200, 8), (401, 1)] {
+            let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+            let fixture = RequestFailureFixture::new_with_timeout(
+                TestServerBehavior::DeferredReply(response_rx),
+                Duration::from_secs(5),
+            )
+            .await;
+            let credential = fixture.grant_credential(false);
+            let mut refreshed = credential.state.lock().await.response();
+            refreshed.token = "refreshed-bearer".into();
+            let body = serde_json::to_string(&refreshed).unwrap();
+            response_tx
+                .send(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .into_bytes(),
+                )
+                .unwrap();
+
+            let server = MockServer::start_async().await;
+            let rejected = server
+                .mock_async(|when, then| {
+                    when.method("PUT")
+                        .path("/resource")
+                        .header("authorization", "Bearer test-bearer")
+                        .header("if", "(<existing-lock>)")
+                        .body("original payload");
+                    then.status(401);
+                })
+                .await;
+            let retried = server
+                .mock_async(|when, then| {
+                    when.method("PUT")
+                        .path("/resource")
+                        .header("authorization", "Bearer refreshed-bearer")
+                        .header("if", "(<existing-lock>)")
+                        .body("original payload");
+                    then.status(retry_status);
+                })
+                .await;
+            let client = reqwest::Client::new();
+            let results = futures_util::future::join_all((0..request_count).map(|_| {
+                credential.send(
+                    client
+                        .put(server.url("/resource"))
+                        .header("if", "(<existing-lock>)")
+                        .body("original payload"),
+                    &fixture.client,
+                )
+            }))
+            .await;
+
+            for result in results {
+                assert_eq!(result.unwrap().status().as_u16(), retry_status);
+            }
+            assert!(rejected.calls_async().await > 0);
+            retried.assert_calls_async(request_count).await;
+            assert_eq!(credential.current_bearer().await, "refreshed-bearer");
+        }
+    }
+
+    #[tokio::test]
+    async fn native_recovery_does_not_retry_other_statuses_or_streamed_bodies() {
+        for (status, streamed) in [(403, false), (423, false), (503, false), (401, true)] {
+            let fixture = RequestFailureFixture::new(TestServerBehavior::Stall).await;
+            let credential = fixture.grant_credential(false);
+            let server = MockServer::start_async().await;
+            let rejected = server
+                .mock_async(|when, then| {
+                    when.method("PUT")
+                        .header("authorization", "Bearer test-bearer");
+                    then.status(status);
+                })
+                .await;
+            let body = if streamed {
+                reqwest::Body::wrap_stream(futures_util::stream::once(async {
+                    Ok::<_, std::io::Error>("payload")
+                }))
+            } else {
+                reqwest::Body::from("payload")
+            };
+            let response = credential
+                .send(
+                    reqwest::Client::new()
+                        .put(server.url("/resource"))
+                        .body(body),
+                    &fixture.client,
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status().as_u16(), status);
+            rejected.assert_calls_async(1).await;
+            assert_eq!(credential.current_bearer().await, "test-bearer");
+        }
+    }
+
+    #[tokio::test]
+    async fn native_refresh_failure_does_not_repeat_the_rejected_mutation() {
+        let fixture = RequestFailureFixture::new_with_timeout(
+            TestServerBehavior::Reply(
+                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 7\r\n\r\nprivate".to_vec(),
+            ),
+            Duration::from_secs(5),
+        )
+        .await;
+        let credential = fixture.grant_credential(false);
+        let server = MockServer::start_async().await;
+        let rejected = server
+            .mock_async(|when, then| {
+                when.method("PUT");
+                then.status(401);
+            })
+            .await;
+
+        let error = credential
+            .send(
+                reqwest::Client::new()
+                    .put(server.url("/resource"))
+                    .body("payload"),
+                &fixture.client,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                Error::CredentialRefresh(CredentialRefreshError::Request {
+                    status: Some(StatusCode::SERVICE_UNAVAILABLE)
+                })
+            ),
+            "unexpected refresh error: {error:?}"
+        );
+        rejected.assert_calls_async(1).await;
+        assert_eq!(credential.current_bearer().await, "test-bearer");
     }
 
     #[derive(Clone, Copy)]
@@ -1701,6 +1898,7 @@ mod tests {
     enum TestServerBehavior {
         /// Write these raw HTTP bytes once the request headers have arrived.
         Reply(Vec<u8>),
+        DeferredReply(tokio::sync::oneshot::Receiver<Vec<u8>>),
         /// Write response headers, then keep the declared body pending.
         ReplyThenStall(Vec<u8>),
         /// Keep the connection open without answering.
@@ -1721,6 +1919,9 @@ mod tests {
             }
             match behavior {
                 TestServerBehavior::Reply(response) => stream.write_all(&response).await.unwrap(),
+                TestServerBehavior::DeferredReply(response) => {
+                    stream.write_all(&response.await.unwrap()).await.unwrap();
+                }
                 TestServerBehavior::ReplyThenStall(response) => {
                     stream.write_all(&response).await.unwrap();
                     tokio::time::sleep(Duration::from_secs(2)).await;

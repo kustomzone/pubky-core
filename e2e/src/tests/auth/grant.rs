@@ -440,9 +440,21 @@ async fn grant_secret_restore_mints_fresh_bearer() {
         original_bearer, restored_bearer,
         "restoring a grant secret must mint a fresh bearer"
     );
+    let session_url = format!(
+        "https://_pubky.{}/auth/grant/session",
+        signer.public_key().z32()
+    );
+    let rejected = pubky
+        .client()
+        .request(Method::GET, &session_url)
+        .bearer_auth(original_bearer)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
     assert!(
-        session.revalidate().await.unwrap().is_none(),
-        "minting the restored bearer replaces the old grant session"
+        session.revalidate().await.unwrap().is_some(),
+        "the retained session recovers its replaced bearer"
     );
     restored
         .storage()
@@ -646,6 +658,87 @@ async fn session_refresh_rotates_short_lived_bearer() {
 
 #[tokio::test]
 #[pubky_testnet::test]
+async fn native_session_recovers_after_same_grant_is_restored_elsewhere() {
+    let testnet = build_full_testnet().await;
+    let pubky = testnet.sdk().unwrap();
+    let signer = pubky.signer(Keypair::random());
+    signer
+        .signup(&testnet.homeserver_app().public_key(), None)
+        .await
+        .unwrap();
+    let session = signer
+        .signin(ClientId::new("native-recovery.test").unwrap())
+        .await
+        .unwrap();
+    let grant = session.as_grant().unwrap();
+    let old_bearer = grant.current_bearer().await;
+    let secret = grant.export_local_secret().await.unwrap();
+    let restored = pubky.restore_session(&secret).await.unwrap();
+    let path = "/priv/native-recovery.test/resource";
+    let url = (signer.public_key(), path)
+        .into_pubky_resource()
+        .unwrap()
+        .to_transport_url()
+        .unwrap();
+    let rejected = pubky
+        .client()
+        .request(Method::PUT, &url)
+        .bearer_auth(&old_bearer)
+        .body("must not be written")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    assert!(!restored.storage().exists(path).await.unwrap());
+
+    // LOCK is not idempotent: replaying a successful acquisition would conflict.
+    let lock = session
+        .storage()
+        .lock(path, Duration::from_secs(60))
+        .await
+        .unwrap();
+    session
+        .storage()
+        .put_locked(&lock, "original payload")
+        .await
+        .unwrap();
+    session.storage().unlock(&lock).await.unwrap();
+    assert_ne!(grant.current_bearer().await, old_bearer);
+    assert_eq!(
+        session
+            .storage()
+            .get(path)
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap(),
+        "original payload"
+    );
+
+    let storage_bearer = grant.current_bearer().await;
+    let restored = pubky.restore_session(&secret).await.unwrap();
+    let revalidated = session.revalidate().await.unwrap().unwrap();
+    assert_eq!(revalidated, session.info().clone());
+    assert_ne!(grant.current_bearer().await, storage_bearer);
+
+    restored.signout().await.unwrap();
+    let error = session
+        .storage()
+        .put(path, "must not replace after revocation")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        Error::CredentialRefresh(CredentialRefreshError::Request {
+            status: Some(StatusCode::UNAUTHORIZED)
+        })
+    ));
+    assert!(session.revalidate().await.unwrap().is_none());
+}
+
+#[tokio::test]
+#[pubky_testnet::test]
 async fn signout_revokes_current_grant_only() {
     let testnet = build_full_testnet().await;
     let server = testnet.homeserver_app();
@@ -725,7 +818,13 @@ async fn signout_is_idempotent() {
         .await
         .unwrap_err();
     assert!(
-        matches!(err, Error::Request(RequestError::Server { status, .. }) if status == StatusCode::UNAUTHORIZED)
+        matches!(
+            err,
+            Error::CredentialRefresh(CredentialRefreshError::Request {
+                status: Some(StatusCode::UNAUTHORIZED)
+            })
+        ),
+        "a signed-out grant must reject bearer recovery, got {err:?}"
     );
 }
 
@@ -916,16 +1015,26 @@ async fn root_session_can_list_and_revoke_scoped_grant() {
         .await
         .unwrap();
 
-    // Scoped session's bearer token is now invalid — the next request gets 401.
+    // Both the stale bearer and its recovery attempt must be rejected after revocation.
     let err = scoped_session
         .storage()
         .put("/pub/scoped.app/after", Vec::<u8>::new())
         .await
         .unwrap_err();
     assert!(
-        matches!(err, Error::Request(RequestError::Server { status, .. }) if status == StatusCode::UNAUTHORIZED),
-        "revoked grant must yield 401, got {err:?}"
+        matches!(
+            err,
+            Error::CredentialRefresh(CredentialRefreshError::Request {
+                status: Some(StatusCode::UNAUTHORIZED)
+            })
+        ),
+        "a revoked grant must reject bearer recovery, got {err:?}"
     );
+    assert!(!root_session
+        .storage()
+        .exists("/pub/scoped.app/after")
+        .await
+        .unwrap());
 
     // Even a revalidation attempt fails with 401.
     let err = scoped_session
