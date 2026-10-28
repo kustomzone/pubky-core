@@ -7,7 +7,10 @@ use axum::{
     Json,
 };
 
-use crate::client_server::auth::{AuthSession, GrantAuthService};
+use pubky_common::capabilities::Action;
+use pubky_common::StoragePath;
+
+use crate::client_server::auth::AuthSession;
 use crate::client_server::cache_policy::CACHE_CONTROL_NO_STORE;
 use crate::client_server::AppState;
 use crate::shared::{HttpError, HttpResult, UserItem};
@@ -23,8 +26,9 @@ const VARY_AUTHORIZATION: HeaderValue = HeaderValue::from_static("Authorization"
 /// cookie-authenticated read would let any origin fetch the signed-in user's
 /// account with the browser's cookie.
 ///
-/// Requires root capability: account state is not scoped to any path, so a
-/// scoped app has no claim to it. Disabled users can still read it, which is
+/// Requires read permission on the root scope (`/:r`, `/:rw`, ...): account
+/// state is not scoped to any path, so a scoped app has no claim to it, and a
+/// read needs no write access. Disabled users can still read it, which is
 /// where they learn why their writes are refused.
 pub async fn get(
     State(state): State<AppState>,
@@ -33,7 +37,14 @@ pub async fn get(
     let AuthSession::Grant(_) = &auth else {
         return Err(HttpError::unauthorized());
     };
-    GrantAuthService::require_root_capability(&auth)?;
+    if !auth
+        .capabilities()
+        .permits(&StoragePath::root(), Action::Read)
+    {
+        return Err(HttpError::forbidden_with_message(
+            "Read access to all storage required",
+        ));
+    }
     let user = state
         .context
         .user_service
@@ -107,46 +118,61 @@ mod tests {
         Capabilities::builder().cap(Capability::root()).finish()
     }
 
+    /// Read access to all storage is the bar, so `/:r` is enough and `/:rw`
+    /// passes too.
     #[tokio::test]
     #[pubky_test_utils::test]
-    async fn root_grant_session_gets_its_own_account() {
+    async fn root_read_grant_sessions_get_their_own_account() {
         let context = AppContext::test().await;
-        let (server, pubkey) = grant_server(&context, root()).await;
+        let read_only = Capabilities::builder().read("/").unwrap().finish();
 
-        let response = server.get("/account").await;
-        response.assert_status(StatusCode::OK);
-        response.assert_header(header::CACHE_CONTROL, "no-store");
-        response.assert_header(header::VARY, "Authorization");
-        let body: serde_json::Value = response.json();
-        assert_eq!(body["pubky"], pubkey.z32());
-        assert!(body["created_at"].is_string());
-        assert_eq!(body["disabled"], false);
-        assert_eq!(body["used_bytes"], 0);
-        assert_eq!(body["quota"]["overrides"], serde_json::json!({}));
-        // The test config sets no storage default, so the effective quota is unlimited.
-        assert_eq!(body["quota"]["effective"]["storage_quota_mb"], "unlimited");
-        let mut keys: Vec<_> = body.as_object().unwrap().keys().collect();
-        keys.sort();
-        assert_eq!(
-            keys,
-            ["created_at", "disabled", "pubky", "quota", "used_bytes"]
-        );
+        for capabilities in [root(), read_only] {
+            let (server, pubkey) = grant_server(&context, capabilities).await;
+
+            let response = server.get("/account").await;
+            response.assert_status(StatusCode::OK);
+            response.assert_header(header::CACHE_CONTROL, "no-store");
+            response.assert_header(header::VARY, "Authorization");
+            let body: serde_json::Value = response.json();
+            assert_eq!(body["pubky"], pubkey.z32());
+            assert!(body["created_at"].is_string());
+            assert_eq!(body["disabled"], false);
+            assert_eq!(body["used_bytes"], 0);
+            assert_eq!(body["quota"]["overrides"], serde_json::json!({}));
+            // The test config sets no storage default, so the effective quota is unlimited.
+            assert_eq!(body["quota"]["effective"]["storage_quota_mb"], "unlimited");
+            let mut keys: Vec<_> = body.as_object().unwrap().keys().collect();
+            keys.sort();
+            assert_eq!(
+                keys,
+                ["created_at", "disabled", "pubky", "quota", "used_bytes"]
+            );
+        }
     }
 
+    /// Neither a path-scoped session nor one that can only write may read
+    /// account-wide state.
     #[tokio::test]
     #[pubky_test_utils::test]
-    async fn scoped_grant_session_is_forbidden() {
+    async fn session_without_root_read_is_forbidden() {
         let context = AppContext::test().await;
         let scoped = Capabilities::builder()
             .read_write("/pub/scoped.app/")
             .unwrap()
             .finish();
-        let (server, _pubkey) = grant_server(&context, scoped).await;
+        let write_only = Capabilities::builder().write("/").unwrap().finish();
+        let keys_only = Capabilities::builder()
+            .encryption_keys("/")
+            .unwrap()
+            .finish();
 
-        server
-            .get("/account")
-            .await
-            .assert_status(StatusCode::FORBIDDEN);
+        for capabilities in [scoped, write_only, keys_only] {
+            let (server, _pubkey) = grant_server(&context, capabilities).await;
+            server
+                .get("/account")
+                .await
+                .assert_status(StatusCode::FORBIDDEN);
+        }
     }
 
     #[tokio::test]

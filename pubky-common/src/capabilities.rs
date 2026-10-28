@@ -379,6 +379,24 @@ impl Capabilities {
         self.0.contains(capability)
     }
 
+    /// Whether any capability covers `path` with `action`.
+    ///
+    /// ```
+    /// use pubky_common::capabilities::{Action, Capabilities};
+    /// use pubky_common::storage_path::StoragePath;
+    ///
+    /// let caps: Capabilities = "/pub/app/:r".parse().unwrap();
+    /// let file = StoragePath::new("/pub/app/file.txt").unwrap();
+    /// assert!(caps.permits(&file, Action::Read));
+    /// assert!(!caps.permits(&file, Action::Write));
+    /// assert!(!caps.permits(&StoragePath::root(), Action::Read));
+    /// ```
+    pub fn permits(&self, path: &StoragePath, action: Action) -> bool {
+        self.0
+            .iter()
+            .any(|cap| cap.scope_covers_path(path) && cap.actions.contains(&action))
+    }
+
     /// Returns `true` if the list is empty.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -975,5 +993,24 @@ mod tests {
         assert!(root.scope_covers_path(&StoragePath::root()));
         assert!(root.scope_covers_path(&path("/pub/anything")));
         assert!(root.scope_covers_path(&path("/dav/some/file.txt")));
+    }
+
+    #[test]
+    fn permits_requires_a_covering_scope_with_the_action() {
+        let root = StoragePath::root();
+        let caps = |s: &str| s.parse::<Capabilities>().unwrap();
+
+        // Only a `/` scope covers `/` itself, with the action asked for.
+        assert!(caps("/:r").permits(&root, Action::Read));
+        assert!(caps("/:rw").permits(&root, Action::Read));
+        assert!(!caps("/:w").permits(&root, Action::Read));
+        assert!(!caps("/:e").permits(&root, Action::Read));
+        assert!(!caps("/pub/app/:rw").permits(&root, Action::Read));
+
+        // Separate entries combine, and a scope covers the paths inside it.
+        let split = caps("/pub/app/:r,/pub/app/:w");
+        assert!(split.permits(&path("/pub/app/file"), Action::Write));
+        assert!(!split.permits(&path("/pub/other"), Action::Read));
+        assert!(!Capabilities::default().permits(&root, Action::Read));
     }
 }
